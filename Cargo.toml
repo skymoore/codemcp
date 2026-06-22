@@ -1,0 +1,48 @@
+[package]
+name = "codemcp"
+version = "0.1.0"
+edition = "2021"
+description = "Meta-MCP code-mode gateway: connect many MCP servers, expose one execute_python tool."
+license = "MIT"
+
+[features]
+default = []
+monty = ["dep:monty"]
+
+[dependencies]
+rmcp = { version = "1.7", features = [
+  "server",
+  "client",
+  "macros",
+  "schemars",
+  "transport-io",
+  "transport-child-process",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client-reqwest",
+] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+which = "8"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+figment = { version = "0.10", features = ["env"] }
+
+# The Monty Rust crate is not published to crates.io under this name; pull from git.
+# Feature-gated and off by default, so default builds never fetch it.
+monty = { git = "https://github.com/pydantic/monty", tag = "v0.0.18", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
