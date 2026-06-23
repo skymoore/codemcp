@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+results/
+ground_truth.json

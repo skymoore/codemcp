@@ -34,6 +34,72 @@ result = {"title": pr["title"], "files_changed": len(pr["files"])}
 
 One model turn, one tool call, only the final result returned.
 
+## Bench: token usage vs direct MCP
+
+A repeatable experiment in [`bench/`](./bench) measures whether the design above
+actually saves model tokens. A standalone LangGraph agent answers three
+read-only questions over the GitHub user `skymoore`'s data, under two arms that
+expose the **identical** GitHub MCP toolset (~41 tools) but differ only in how
+it reaches the model:
+
+| arm | what the model sees |
+|---|---|
+| `direct` | all ~41 GitHub tools bound directly (large per-turn tool schema) |
+| `codemcp` | one `execute_python` tool whose description lists ~41 two-line signatures |
+
+Both arms run the same model (`claude-sonnet-4-6` via the OpenCode Zen
+Anthropic endpoint, `temperature=0`), the same upstream GitHub MCP server, and a
+fresh MCP client + (for codemcp) fresh gateway subprocess per run. Token counts
+are the provider's own `usage` figures (Anthropic `usage` block), summed per run.
+Each (task, arm) is repeated 3× for variance. Correctness is reviewed manually
+against `ground_truth.json`, computed by calling the GitHub tools directly
+(no LLM).
+
+### Results (18 runs, all answered correctly)
+
+| task | direct input | codemcp input | Δinput | direct turns | codemcp turns |
+|---|---|---|---|---|---|
+| A — repo count (1 tool call) | 25,233 | 22,816 | **−2,417 (−10%)** | 2.0 | 2.0 |
+| B — most-starred repo's latest commit (2 calls) | 35,779 | 15,981 | **−19,798 (−55%)** | 3.0 | 3.0 |
+| C — most-issues repo + README check (2 calls) | 399,456 | 41,702 | **−357,755 (−90%)** | 3.0 | 3.7 |
+
+Headline: on the multi-tool tasks codemcp cut **input** tokens 55–90%; on the
+1-tool baseline it's roughly flat. `cache_read` was 0 across all runs (Zen
+returned no prompt-cache hits on these short sessions, so this is the
+no-caching case — a separate, larger-context run would be needed to measure
+caching behavior). Full per-run answers, per-turn usage, and the manual-review
+section are in `bench/results/summary.md` after a run.
+
+> One toolset (GitHub) and three tasks — a real data point, not an exhaustive
+> benchmark. Re-run it and vary the tasks/toolset yourself.
+
+### Run it yourself
+
+From the repo root:
+
+```sh
+cd bench
+uv sync                                   # install pinned deps into a local venv
+uv run python ground_truth.py             # compute ground_truth.json (no LLM)
+uv run python runner.py --smoke           # 6 runs: connectivity check
+uv run python runner.py --reset --repeats 3   # full bench: 18 runs
+uv run python analyze.py                  # -> results/summary.{md,csv}
+cat results/summary.md
+```
+
+Prerequisites:
+
+- `codemcp` on your `PATH` (the codemcp arm launches a fresh gateway per run).
+- A working Docker daemon (the GitHub MCP server runs in a container).
+- An OpenCode Zen API key: sign in at https://opencode.ai/auth and run
+  `opencode /connect` once so it's stored in `~/.local/share/opencode/auth.json`.
+- A GitHub personal access token in `bench/.env` as `GITHUB_TOKEN` (git-ignored;
+  `bench/mcp.github.json` uses `{env:GITHUB_TOKEN}`). One is already there if you
+  cloned this setup; otherwise add your own with `repo` + `read:org` scopes.
+
+See [`bench/README.md`](./bench/README.md) for the full methodology, fairness
+notes, and file layout.
+
 ## Status
 
 Working vertical slice over **stdio** and **Streamable HTTP**:
