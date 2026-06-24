@@ -4,6 +4,9 @@
 //! calls to the owning server. Failed upstreams are logged and skipped (never
 //! fatal). Upstreams can be connected/disconnected at runtime via the admin
 //! interface, so the set lives behind an `RwLock`.
+//!
+//! Remote servers that require OAuth are tracked with an `AuthStatus` so
+//! `codemcp list` can inform the user when authentication is needed.
 
 mod client;
 
@@ -13,10 +16,13 @@ use std::sync::Arc;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use tokio::sync::RwLock;
 
+use crate::auth::AuthStatus;
 use crate::config::{ServerSpec, UpstreamConfig};
 use crate::error::Error;
 
+// Re-exported so auth::oauth_client can use the same default timeout.
 use client::UpstreamService;
+pub(crate) use client::DEFAULT_CONNECT_TIMEOUT_SECS;
 
 /// One connected upstream: its live service plus the tools it exposes.
 struct Upstream {
@@ -31,9 +37,21 @@ pub struct NamespacedTool {
     pub tool: Tool,
 }
 
+/// The outcome of connecting + listing tools for one upstream.
+struct UpstreamOutcome {
+    /// The connected upstream, if the connection succeeded.
+    upstream: Option<Upstream>,
+    /// Auth status for this server.
+    auth_status: AuthStatus,
+    /// Error message if the connection failed.
+    error: Option<String>,
+}
+
 /// Holds all upstream connections and provides tool routing.
 pub struct UpstreamManager {
     upstreams: RwLock<HashMap<String, Upstream>>,
+    /// Auth status per server (persisted even when not connected).
+    auth_status: RwLock<HashMap<String, AuthStatus>>,
 }
 
 impl UpstreamManager {
@@ -45,48 +63,73 @@ impl UpstreamManager {
             let name = cfg.name.clone();
             let spec = cfg.spec.clone();
             tasks.push(tokio::spawn(async move {
-                let res = connect_and_list(&name, &spec).await;
-                (name, res)
+                let outcome = connect_and_list(&name, &spec).await;
+                (name, outcome)
             }));
         }
 
         let mut upstreams = HashMap::new();
+        let mut auth_status = HashMap::new();
         for task in tasks {
-            let (name, res) = match task.await {
+            let (name, outcome) = match task.await {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::error!(error = %e, "upstream connect task panicked");
                     continue;
                 }
             };
-            match res {
-                Ok(up) => {
+            auth_status.insert(name.clone(), outcome.auth_status.clone());
+            match outcome.upstream {
+                Some(up) => {
                     tracing::info!(server = %name, tools = up.tools.len(), "connected upstream");
                     upstreams.insert(name, up);
                 }
-                Err(e) => {
-                    tracing::error!(server = %name, error = %e, "failed to connect upstream");
+                None => {
+                    if let Some(err) = &outcome.error {
+                        tracing::error!(server = %name, error = %err, "failed to connect upstream");
+                    }
                 }
             }
         }
 
         Self {
             upstreams: RwLock::new(upstreams),
+            auth_status: RwLock::new(auth_status),
         }
     }
 
     /// Connect a single upstream at runtime. Replaces any existing connection
-    /// with the same name.
-    pub async fn connect_one(&self, name: &str, spec: &ServerSpec) -> Result<usize, Error> {
-        let up = connect_and_list(name, spec).await?;
-        let count = up.tools.len();
-        let mut guard = self.upstreams.write().await;
-        if let Some(old) = guard.insert(name.to_string(), up) {
-            // Drop the previous connection cleanly.
-            let _ = old.service.cancel().await;
+    /// with the same name. Returns the number of tools and the auth status.
+    pub async fn connect_one(
+        &self,
+        name: &str,
+        spec: &ServerSpec,
+    ) -> Result<(usize, AuthStatus), Error> {
+        let outcome = connect_and_list(name, spec).await;
+        let auth_status = outcome.auth_status.clone();
+
+        // Record auth status regardless of connection outcome.
+        self.auth_status
+            .write()
+            .await
+            .insert(name.to_string(), auth_status.clone());
+
+        match outcome.upstream {
+            Some(up) => {
+                let count = up.tools.len();
+                let mut guard = self.upstreams.write().await;
+                if let Some(old) = guard.insert(name.to_string(), up) {
+                    let _ = old.service.cancel().await;
+                }
+                tracing::info!(server = %name, tools = count, "connected upstream (runtime)");
+                Ok((count, auth_status))
+            }
+            None => {
+                Err(Error::Upstream(outcome.error.unwrap_or_else(|| {
+                    format!("unknown error connecting {name}")
+                })))
+            }
         }
-        tracing::info!(server = %name, tools = count, "connected upstream (runtime)");
-        Ok(count)
     }
 
     /// Disconnect a single upstream at runtime. Returns true if it was connected.
@@ -107,6 +150,17 @@ impl UpstreamManager {
     /// Whether the named upstream is currently connected.
     pub async fn is_connected(&self, name: &str) -> bool {
         self.upstreams.read().await.contains_key(name)
+    }
+
+    /// Get the auth status for a server.
+    #[allow(dead_code)]
+    pub async fn auth_status(&self, name: &str) -> AuthStatus {
+        self.auth_status
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .unwrap_or(AuthStatus::NotApplicable)
     }
 
     /// All tools across all connected upstreams, tagged with their server name.
@@ -152,8 +206,7 @@ impl UpstreamManager {
 
     /// Gracefully disconnect every upstream (does not consume `self`).
     pub async fn shutdown(&self) {
-        let drained: Vec<(String, Upstream)> =
-            { self.upstreams.write().await.drain().collect() };
+        let drained: Vec<(String, Upstream)> = { self.upstreams.write().await.drain().collect() };
         for (name, up) in drained {
             if let Err(e) = up.service.cancel().await {
                 tracing::warn!(server = %name, error = %e, "error during upstream shutdown");
@@ -163,16 +216,36 @@ impl UpstreamManager {
 }
 
 /// Connect to one upstream and list its tools.
-async fn connect_and_list(name: &str, spec: &ServerSpec) -> Result<Upstream, Error> {
-    let service = client::connect(name, spec).await?;
+async fn connect_and_list(name: &str, spec: &ServerSpec) -> UpstreamOutcome {
+    let result = client::connect(name, spec).await;
+
+    let service = match result.service {
+        Some(s) => s,
+        None => {
+            return UpstreamOutcome {
+                upstream: None,
+                auth_status: result.auth_status,
+                error: result.error,
+            };
+        }
+    };
+
     let tools = match service.list_all_tools().await {
         Ok(tools) => tools,
         Err(e) => {
             let _ = service.cancel().await;
-            return Err(Error::Upstream(format!("{name}: list_tools failed: {e}")));
+            return UpstreamOutcome {
+                upstream: None,
+                auth_status: result.auth_status,
+                error: Some(format!("{name}: list_tools failed: {e}")),
+            };
         }
     };
-    Ok(Upstream { service, tools })
+    UpstreamOutcome {
+        upstream: Some(Upstream { service, tools }),
+        auth_status: result.auth_status,
+        error: None,
+    }
 }
 
 /// Convenience wrapper so the manager can be shared across tasks.

@@ -70,11 +70,7 @@ impl Launcher {
 fn parent_info() -> (Option<u32>, Option<String>) {
     let mut sys = System::new();
     // Refresh just process metadata; this is enough to walk parent links.
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing(),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     let me = match sysinfo::get_current_pid() {
         Ok(pid) => pid,

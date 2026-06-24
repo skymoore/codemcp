@@ -1,17 +1,21 @@
 [package]
 name = "codemcp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Meta-MCP code-mode gateway: connect many MCP servers, expose one execute_python tool."
 license = "MIT"
 
 [features]
-default = ["docker"]
+default = ["docker", "tui"]
 docker = ["dep:bollard"]
 monty = ["dep:monty"]
+# Interactive terminal UI for the admin client (enable/disable servers & tools
+# with default/session semantics). On by default; lean gateway builds drop it
+# with `--no-default-features --features docker`.
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
-rmcp = { version = "1.7", features = [
+rmcp = { version = "1.8", features = [
   "server",
   "client",
   "macros",
@@ -20,6 +24,7 @@ rmcp = { version = "1.7", features = [
   "transport-child-process",
   "transport-streamable-http-server",
   "transport-streamable-http-client-reqwest",
+  "auth",
 ] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
@@ -32,6 +37,10 @@ schemars = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
+url = "2"
+# Used for the TokenResponse trait to inspect OAuth token expiry in auth status.
+# Already in the dep tree via rmcp's `auth` feature; this makes it a direct dep.
+oauth2 = { version = "5.0", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 which = "8"
@@ -44,6 +53,11 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 figment = { version = "0.10", features = ["env"] }
 axum = "0.8"
+# Opens the OAuth authorization URL in the user's browser from the CLI.
+# Cross-platform (macOS `open`, Linux `xdg-open`, Windows `start`), no deps.
+webbrowser = "1"
+# Advisory file locking for atomic concurrent writes to mcp-auth.json.
+fs4 = "0.9"
 # Used only to auto-detect the launching application (parent process name) for
 # `codemcp info`/`list`. `system` feature is enough; we don't need disk/net/etc.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
@@ -61,6 +75,13 @@ bollard = { version = "0.21", default-features = false, features = [
 # The Monty Rust crate is not published to crates.io under this name; pull from git.
 # Feature-gated and off by default, so default builds never fetch it.
 monty = { git = "https://github.com/pydantic/monty", tag = "v0.0.18", optional = true }
+
+# Interactive terminal UI (admin client). Feature-gated via `tui`; crossterm is
+# the cross-platform backend (Linux/macOS/Windows, works with musl static
+# builds). ratatui's default features pull crossterm 0.29.x, which we depend on
+# directly for event reading so the versions stay unified.
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

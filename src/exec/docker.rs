@@ -96,13 +96,19 @@ impl DockerExecutor {
         ensure_image(&docker, &settings.docker_image).await?;
 
         // 6. Create + start a hardened container.
-        let container_id =
-            create_and_start(&docker, settings, &workdir, &control_url, &token, add_host_gateway)
-                .await
-                .inspect_err(|_| {
-                    // Best-effort cleanup of the workdir on a failed start.
-                    let _ = std::fs::remove_dir_all(&workdir);
-                })?;
+        let container_id = create_and_start(
+            &docker,
+            settings,
+            &workdir,
+            &control_url,
+            &token,
+            add_host_gateway,
+        )
+        .await
+        .inspect_err(|_| {
+            // Best-effort cleanup of the workdir on a failed start.
+            let _ = std::fs::remove_dir_all(&workdir);
+        })?;
         let _ = addr;
 
         tracing::info!(%control_url, image = %settings.docker_image, container = %container_id, "started docker python worker");
@@ -309,13 +315,16 @@ async fn create_and_start(
         env_vars.push(format!("CODEMCP_WS_VERSION={v}"));
     }
     if !settings.ws_pip_args.is_empty() {
-        env_vars.push(format!("CODEMCP_WS_PIP_ARGS={}", settings.ws_pip_args.join(" ")));
+        env_vars.push(format!(
+            "CODEMCP_WS_PIP_ARGS={}",
+            settings.ws_pip_args.join(" ")
+        ));
     }
 
     // On Docker Desktop topology the worker reaches us via host.docker.internal,
     // which must be mapped to the host gateway inside the container.
-    let extra_hosts = add_host_gateway
-        .then(|| vec!["host.docker.internal:host-gateway".to_string()]);
+    let extra_hosts =
+        add_host_gateway.then(|| vec!["host.docker.internal:host-gateway".to_string()]);
 
     let host_config = HostConfig {
         binds: Some(vec![bind]),
@@ -327,8 +336,7 @@ async fn create_and_start(
         security_opt: Some(vec!["no-new-privileges".to_string()]),
         readonly_rootfs: Some(settings.docker_readonly),
         memory: (settings.docker_memory > 0).then_some(settings.docker_memory),
-        nano_cpus: (settings.docker_cpus > 0.0)
-            .then_some((settings.docker_cpus * 1e9) as i64),
+        nano_cpus: (settings.docker_cpus > 0.0).then_some((settings.docker_cpus * 1e9) as i64),
         pids_limit: (settings.docker_pids_limit > 0).then_some(settings.docker_pids_limit),
         ..Default::default()
     };
@@ -358,7 +366,10 @@ async fn create_and_start(
         .map_err(|e| Error::Docker(format!("failed to create container: {e}")))?;
 
     docker
-        .start_container(&created.id, None::<bollard::query_parameters::StartContainerOptions>)
+        .start_container(
+            &created.id,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
         .await
         .map_err(|e| Error::Docker(format!("failed to start container {}: {e}", created.id)))?;
 

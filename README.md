@@ -110,6 +110,9 @@ Working vertical slice over **stdio** and **Streamable HTTP**:
 - Runs user Python in a persistent host CPython worker; SDK calls round-trip back
   to the gateway over an authenticated WebSocket control channel and are routed to
   the right upstream server.
+- Authenticates to OAuth-protected remote MCP servers via a full OAuth 2.1
+  browser flow (`codemcp auth <name>`). Tokens auto-refresh and persist across
+  restarts.
 
 Runs untrusted agents safely with `CODEMCP_ISOLATION=DOCKER` (the worker runs in
 a container; see [Docker isolation](#docker-isolation)). The Monty in-process
@@ -159,6 +162,13 @@ make help                    # list all targets
 
 Or with cargo directly: `cargo install --path .`.
 
+**Feature flags:**
+
+| Feature | Default | What it adds | How to enable / disable |
+|---|---|---|---|
+| `docker` | **on** | Docker isolation backend (bollard) | Disable: `--no-default-features` |
+| `tui` | off | Interactive terminal UI (`codemcp tui`) | Enable: `--features tui` |
+
 ## Quick start
 
 ### Set up from an existing harness (opencode)
@@ -191,6 +201,19 @@ verbatim** into codemcp's `mcp.json`, and rewrites opencode to launch a single
          "type": "remote",
          "url": "https://mcp.sentry.dev/mcp",
          "headers": { "Authorization": "Bearer {env:SENTRY_TOKEN}" }
+       },
+       "github": {
+         "type": "remote",
+         "url": "https://api.githubcopilot.com/mcp/",
+         "tools": {
+           "noisy_tool":   { "enabled": false },
+           "another_tool": { "enabled": false }
+         }
+       },
+       "linear": {
+         "type": "remote",
+         "url": "https://mcp.linear.app/mcp",
+         "oauth": { "scope": "read" }
        }
      }
    }
@@ -200,10 +223,15 @@ verbatim** into codemcp's `mcp.json`, and rewrites opencode to launch a single
      `environment`, `cwd`).
    - `type: "remote"` → Streamable HTTP server at `url` (with optional `headers`).
    - Any string value supports `{env:VAR}` interpolation.
-   - `"enabled": false` skips an entry.
+   - `"enabled": false` skips a server at boot.
+   - `"tools": { "<name>": { "enabled": false } }` hides individual tools by
+     default. Omitted tools default to enabled. See
+     [Enabling/disabling tools](#enablingdisabling-tools-at-runtime) below.
    - `"timeout": <seconds>` caps how long to wait for that upstream to spawn and
      finish the MCP handshake (default 30s). An upstream that exceeds it is
      logged and skipped rather than blocking startup.
+   - `"oauth"` controls OAuth 2.1 authentication for remote servers — see
+     [Authenticating remote MCP servers](#authenticating-remote-mcp-servers-oauth).
 
 2. Run the gateway:
 
@@ -235,17 +263,20 @@ codemcp disable github       # disconnect 'github' now (runtime only)
 ```
 
 ```
-NAME                   TYPE    DEFAULT   CONNECTED  TOOLS
-github                 local   yes       yes        45
-brave                  local   no        no         0
+NAME                   TYPE    DEFAULT   CONNECTED  AUTH              TOOLS
+github                 remote  yes       yes        authenticated     45
+linear                 remote  yes       no         needs_auth (Run: codemcp auth linear)  0
+brave                  local   no        no         n/a               0
 ```
 
 - `DEFAULT` = the `enabled` flag in `mcp.json` (what connects at boot).
 - `CONNECTED` = whether it is connected in the running process right now.
+- `AUTH` = OAuth authentication status for remote servers (see below).
+- `TOOLS` = count of **effective** tools (connected and not individually disabled).
 
 By default admin commands change **only the live process** and do **not** touch
 `mcp.json`. To also persist the change as the new boot default, pass
-`--make-default`:
+`--make-default` (short: `-d`):
 
 ```bash
 codemcp enable brave --make-default    # connect now AND set enabled:true in mcp.json
@@ -259,6 +290,194 @@ re-read the updated `execute_python` description.
 
 > Note: `--make-default` rewrites `mcp.json` (preserving all values) and may
 > reorder keys alphabetically.
+
+## Enabling/disabling tools at runtime
+
+You can enable or disable **individual tools** within a connected server without
+touching the server itself. Disabling a tool removes it from the SDK and the
+`execute_python` description — the LLM can no longer call it — while the server
+stays connected so its other tools keep working.
+
+```bash
+codemcp tools                                    # list all tools across all servers
+codemcp enable-tool github create_repository     # expose one tool (session only)
+codemcp disable-tool github delete_repository    # hide one tool (session only)
+codemcp disable-tool github delete_repository -d # hide AND persist to mcp.json
+```
+
+```
+SERVER             TOOL                       ON      DEFAULT  SESSION  SUMMARY
+github             create_issue               yes     on       -        Create a GitHub issue
+github             delete_repository          off     off      -        Delete a repository
+github             list_commits               yes     on       s        List commits on a branch
+```
+
+- `ON` = the **effective** state (what the model currently sees).
+- `DEFAULT` = the persisted default from `mcp.json` (`on` if unset).
+- `SESSION` = an in-memory override for this gateway run only (`s` = overridden, `-` = follows default).
+
+**Session vs. default:**
+
+| Flag | Effect |
+|---|---|
+| _(no flag)_ | Change the live process only; reverts to config default on next restart. |
+| `--make-default` / `-d` | Also writes `tools.<name>.enabled: true/false` to `mcp.json`; persists across restarts. |
+
+Enabling a tool on a disconnected server auto-connects it first. Disabling a tool
+never disconnects its server.
+
+## Authenticating remote MCP servers (OAuth)
+
+Remote MCP servers that require OAuth 2.1 authentication are supported
+out of the box. codemcp auto-detects when a server requires auth — no
+config change needed unless the server needs a pre-registered client ID.
+
+### Auto-detection
+
+For any remote server without an `Authorization` header and without
+`oauth: false`, codemcp automatically:
+
+1. Attempts a plain connection.
+2. If the server signals that auth is required, discovers its OAuth
+   authorization server metadata (RFC 8414 / RFC 9728).
+3. Reports the server as `needs_auth` in `codemcp list` with a hint.
+
+```
+NAME     TYPE    DEFAULT  CONNECTED  AUTH                                    TOOLS
+linear   remote  yes      no         needs_auth (Run: codemcp auth linear)   0
+```
+
+### Authenticating
+
+```bash
+codemcp auth linear          # start OAuth flow → opens browser, waits for callback
+codemcp auth                 # list all remote servers and their auth status
+codemcp auth --list          # same
+codemcp logout linear        # remove stored credentials and disconnect
+```
+
+`codemcp auth <name>` runs the full OAuth 2.1 authorization code flow with
+PKCE (RFC 7636):
+1. Discovers the server's authorization server metadata.
+2. Dynamically registers a client if the server supports it (RFC 7591), or
+   uses the configured `clientId` if provided.
+3. Starts a temporary localhost callback server on an ephemeral port.
+4. Prints the authorization URL and opens it in your browser.
+5. Waits up to 5 minutes for the browser to complete the flow and redirect
+   to the callback URL.
+6. Exchanges the authorization code for access + refresh tokens.
+7. Persists the tokens to `~/.config/codemcp/mcp-auth.json` (mode 0600).
+8. Reconnects the upstream using the new credentials.
+
+Tokens are **auto-refreshed** on each request (the gateway handles this
+transparently) and **re-persisted** after each refresh, so subsequent
+gateway restarts pick up the latest token without re-authenticating.
+
+### OAuth config
+
+By default codemcp uses auto-detection and dynamic client registration. Add
+an `oauth` block to a remote server entry to customize:
+
+```json
+{
+  "mcp": {
+    "linear": {
+      "type": "remote",
+      "url": "https://mcp.linear.app/mcp",
+      "oauth": {
+        "scope": "read write",
+        "callbackPort": 19876
+      }
+    },
+    "custom-server": {
+      "type": "remote",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": {
+        "clientId": "my-pre-registered-client-id",
+        "clientSecret": "{env:MCP_CLIENT_SECRET}",
+        "scope": "mcp:read",
+        "redirectUri": "http://127.0.0.1:19876/callback"
+      }
+    },
+    "bearer-only": {
+      "type": "remote",
+      "url": "https://mcp.example.com/mcp",
+      "oauth": false,
+      "headers": { "Authorization": "Bearer {env:API_TOKEN}" }
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `oauth` (absent) | — | Auto-detect: try OAuth if the server requires it. |
+| `oauth: true` | — | Same as absent — explicit auto-detect. |
+| `oauth: false` | — | Disable OAuth; use `headers`/bearer only. |
+| `oauth.clientId` | — | Pre-registered OAuth client ID. If absent, dynamic registration (RFC 7591) is attempted. |
+| `oauth.clientSecret` | — | OAuth client secret (if required by the authorization server). Supports `{env:VAR}`. |
+| `oauth.scope` | _(auto)_ | OAuth scopes to request. If absent, the SDK selects scopes from the server's metadata. |
+| `oauth.callbackPort` | _(ephemeral)_ | Port for the local OAuth callback server. Use a fixed port when a pre-registered `clientId` has a specific redirect URI. |
+| `oauth.redirectUri` | _(derived from port)_ | Full OAuth redirect URI. Overrides `callbackPort`. Must match what's registered with the authorization server. |
+
+**Bearer tokens (`Authorization` header) take priority** — if the server
+entry has an `Authorization` header, OAuth is skipped regardless of the
+`oauth` field.
+
+### Token storage
+
+OAuth credentials are stored in `~/.config/codemcp/mcp-auth.json`
+(mode 0600, file-locked against concurrent writes). The file is keyed by
+server name and includes the access token, refresh token, granted scopes,
+and the server URL (to detect config changes). Removing credentials:
+
+```bash
+codemcp logout linear          # revoke + delete via the running gateway
+# or directly:
+# delete the entry from ~/.config/codemcp/mcp-auth.json
+```
+
+## Interactive TUI
+
+`codemcp tui` opens a full-screen terminal interface for managing servers and tools
+against a running gateway — useful when you want to explore what's exposed and
+flip things interactively without typing subcommands.
+
+```bash
+codemcp tui             # auto-selects the single running gateway
+codemcp tui -i opencode # target a specific gateway by launcher name, config, or PID
+```
+
+**Layout:** left pane lists servers; right pane lists tools of the selected server.
+
+```
+┌ Servers ──────────────────────┐┌ Tools — github ────────────────────────────────────────────┐
+│▸ ● github   local  def:on 45t ││▸ ON    create_issue               Create a GitHub issue    │
+│  ● sentry   remote def:on 12t ││  ON    list_pull_requests         List pull requests        │
+│  ○ brave    local  def:off 0t ││  off   delete_repository          Delete a repository       │
+└───────────────────────────────┘└────────────────────────────────────────────────────────────┘
+ [opencode] pid 40012 ~/.config/codemcp/mcp.json  github/delete_repository disabled [session]
+ Space:session  D:default  Tab:pane  j/k:move  r:refresh  ?:help  q:quit
+```
+
+**Keybindings:**
+
+| Key | Action |
+|---|---|
+| `j` / `↓` | Move selection down |
+| `k` / `↑` | Move selection up |
+| `Tab` | Switch focus between servers and tools panes |
+| `Space` / `Enter` | Toggle the selected item (session only — reverts on restart) |
+| `D` | Toggle the selected item and persist as the new default in `mcp.json` |
+| `r` | Refresh now (the UI also auto-refreshes every 3 s) |
+| `?` | Show/hide help overlay |
+| `q` / `Ctrl-C` | Quit |
+
+`●` = server connected; `○` = disconnected. Tools show `(s)` when a session
+override is active, `(d)` when the configured default is off.
+
+The TUI requires the `tui` cargo feature (on by default). Build without it to get
+a smaller gateway-only binary: `cargo build --release --no-default-features --features docker`.
 
 Most flags have short forms: `-d` (`--make-default`), `-i` (`--instance`),
 `-p` (`--port`), `-H` (`--host`).

@@ -60,7 +60,11 @@ fn setup_opencode() -> Result<(), Error> {
 
     // 1) Back up the opencode config.
     let backup = backup_file(&opencode_path)?;
-    println!("backed up {} -> {}", opencode_path.display(), backup.display());
+    println!(
+        "backed up {} -> {}",
+        opencode_path.display(),
+        backup.display()
+    );
 
     // 2) Move the mcp section verbatim into codemcp's mcp.json (backing up any
     //    existing one first).
@@ -127,7 +131,9 @@ fn setup_opencode() -> Result<(), Error> {
 }
 
 fn opencode_config_path() -> Result<PathBuf, Error> {
-    Ok(crate::env::config_base().join("opencode").join("opencode.json"))
+    Ok(crate::env::config_base()
+        .join("opencode")
+        .join("opencode.json"))
 }
 
 /// Copy `path` to a timestamped `.bak.<ts>` sibling. Returns the backup path.

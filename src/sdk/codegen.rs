@@ -171,7 +171,11 @@ pub fn build_binding(
     let required: Vec<String> = input_schema
         .get("required")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Preserve declared property order; required params first so non-default

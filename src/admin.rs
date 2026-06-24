@@ -6,6 +6,9 @@
 //!   - `list`    -> `{ servers: [ServerStatus] }`
 //!   - `enable`  { name, make_default? } -> `{ name, connected, tools }`
 //!   - `disable` { name, make_default? } -> `{ name, connected }`
+//!   - `tools`        -> `{ tools: [ToolStatus] }`
+//!   - `enable_tool`  { server, tool, make_default? } -> `{ server, tool, enabled, made_default }`
+//!   - `disable_tool` { server, tool, make_default? } -> `{ server, tool, enabled, made_default }`
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +90,21 @@ pub struct EnableParams {
     pub name: String,
     #[serde(default)]
     pub make_default: bool,
+}
+
+/// Params for the tool-level `enable_tool` / `disable_tool` methods.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ToolParams {
+    pub server: String,
+    pub tool: String,
+    #[serde(default)]
+    pub make_default: bool,
+}
+
+/// Params for the auth methods (`auth_start`, `auth_finish`, `auth_remove`).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct NameParams {
+    pub name: String,
 }
 
 /// Start the admin Unix-socket server on this instance's per-instance socket
@@ -200,6 +218,76 @@ async fn dispatch(runtime: &Runtime, req: Request) -> Value {
             },
             Err(e) => json!({ "error": format!("bad params: {e}") }),
         },
+        "tools" => {
+            let tools = runtime.list_tools().await;
+            json!({ "tools": tools })
+        }
+        "enable_tool" => match serde_json::from_value::<ToolParams>(req.params) {
+            Ok(p) => match runtime
+                .enable_tool(&p.server, &p.tool, p.make_default)
+                .await
+            {
+                Ok(enabled) => json!({
+                    "server": p.server,
+                    "tool": p.tool,
+                    "enabled": enabled,
+                    "made_default": p.make_default,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(e) => json!({ "error": format!("bad params: {e}") }),
+        },
+        "disable_tool" => match serde_json::from_value::<ToolParams>(req.params) {
+            Ok(p) => match runtime
+                .disable_tool(&p.server, &p.tool, p.make_default)
+                .await
+            {
+                Ok(enabled) => json!({
+                    "server": p.server,
+                    "tool": p.tool,
+                    "enabled": enabled,
+                    "made_default": p.make_default,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(e) => json!({ "error": format!("bad params: {e}") }),
+        },
+        // --- OAuth authentication ---
+        "auth_start" => match serde_json::from_value::<NameParams>(req.params) {
+            Ok(p) => match runtime.auth_start(&p.name).await {
+                Ok(result) => json!({
+                    "authorization_url": result.authorization_url,
+                    "oauth_state": result.oauth_state,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(e) => json!({ "error": format!("bad params: {e}") }),
+        },
+        "auth_finish" => match serde_json::from_value::<NameParams>(req.params) {
+            Ok(p) => match runtime.auth_finish(&p.name).await {
+                Ok(tools) => json!({
+                    "name": p.name,
+                    "connected": true,
+                    "tools": tools,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(e) => json!({ "error": format!("bad params: {e}") }),
+        },
+        "auth_remove" => match serde_json::from_value::<NameParams>(req.params) {
+            Ok(p) => match runtime.auth_remove(&p.name).await {
+                Ok(existed) => json!({
+                    "name": p.name,
+                    "removed": existed,
+                }),
+                Err(e) => json!({ "error": e.to_string() }),
+            },
+            Err(e) => json!({ "error": format!("bad params: {e}") }),
+        },
+        "auth_status" => {
+            let servers = runtime.list().await;
+            json!({ "servers": servers })
+        }
         other => json!({ "error": format!("unknown method: {other}") }),
     }
 }
@@ -321,4 +409,12 @@ pub async fn client_request(
 ) -> Result<Value, Error> {
     let instance = select_instance(selector).await?;
     request_on(&instance.socket, method, params).await
+}
+
+/// Client side: send one request to a specific (already-selected) gateway's
+/// admin socket. Used by the TUI, which selects an instance once and then
+/// issues many requests against it without re-discovering each time.
+#[allow(dead_code)]
+pub async fn client_request_on(socket: &Path, method: &str, params: Value) -> Result<Value, Error> {
+    request_on(socket, method, params).await
 }

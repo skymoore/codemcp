@@ -7,6 +7,7 @@
 //! subcommands are an admin client that talks to a running gateway.
 
 mod admin;
+mod auth;
 mod cli;
 mod config;
 mod control;
@@ -19,6 +20,7 @@ mod runtime;
 mod sdk;
 mod server;
 mod setup;
+mod tui;
 mod upstream;
 
 use std::sync::Arc;
@@ -73,9 +75,9 @@ async fn build_executor(
     upstreams: crate::upstream::SharedUpstreams,
 ) -> Result<Arc<dyn Executor>> {
     match settings.isolation {
-        Isolation::HostSystem => {
-            Ok(Arc::new(HostExecutor::start(settings, sdk_py, upstreams).await?))
-        }
+        Isolation::HostSystem => Ok(Arc::new(
+            HostExecutor::start(settings, sdk_py, upstreams).await?,
+        )),
         Isolation::Docker => {
             #[cfg(feature = "docker")]
             {
@@ -150,7 +152,10 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     if let Ok(code) = std::env::var("CODEMCP_SMOKE") {
         let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
         let out = executor.run(code).await?;
-        eprintln!("=== result ===\n{}", serde_json::to_string_pretty(&out.result)?);
+        eprintln!(
+            "=== result ===\n{}",
+            serde_json::to_string_pretty(&out.result)?
+        );
         eprintln!("=== stdout ===\n{}", out.stdout);
         eprintln!("=== stderr ===\n{}", out.stderr);
         if let Some(err) = &out.error {

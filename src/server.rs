@@ -64,12 +64,11 @@ impl CodeServer {
 
 impl ServerHandler for CodeServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "codemcp gateway: write Python that calls connected MCP tools as typed \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "codemcp gateway: write Python that calls connected MCP tools as typed \
                  functions and returns a combined result in one step. See the \
                  `execute_python` tool description for the available SDK.",
-            )
+        )
     }
 
     async fn list_tools(

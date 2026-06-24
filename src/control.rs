@@ -66,7 +66,7 @@ impl ControlHandle {
             "params": { "code": code }
         });
         self.outbound
-            .send(Message::Text(msg.to_string().into()))
+            .send(Message::Text(msg.to_string()))
             .map_err(|_| Error::Worker("worker connection closed".into()))?;
 
         rx.await
@@ -89,7 +89,7 @@ impl ControlHandle {
             "params": { "sdk": sdk_py }
         });
         self.outbound
-            .send(Message::Text(msg.to_string().into()))
+            .send(Message::Text(msg.to_string()))
             .map_err(|_| Error::Worker("worker connection closed".into()))?;
 
         let out = rx
@@ -195,13 +195,8 @@ impl ControlServer {
                         break;
                     }
                 };
-                if let Err(e) = handle_incoming(
-                    &text,
-                    &pending_reader,
-                    &upstreams,
-                    &outbound_for_reader,
-                )
-                .await
+                if let Err(e) =
+                    handle_incoming(&text, &pending_reader, &upstreams, &outbound_for_reader).await
                 {
                     tracing::warn!(error = %e, "error handling worker frame");
                 }
@@ -256,15 +251,14 @@ async fn handle_incoming(
                 if let Some(err) = msg.get("error") {
                     let _ = tx.send(Err(Error::Worker(err.to_string())));
                 } else {
-                    let out: RunOutput = serde_json::from_value(
-                        msg.get("result").cloned().unwrap_or(Value::Null),
-                    )
-                    .unwrap_or(RunOutput {
-                        result: Value::Null,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        error: Some("malformed run result".into()),
-                    });
+                    let out: RunOutput =
+                        serde_json::from_value(msg.get("result").cloned().unwrap_or(Value::Null))
+                            .unwrap_or(RunOutput {
+                                result: Value::Null,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                error: Some("malformed run result".into()),
+                            });
                     let _ = tx.send(Ok(out));
                 }
             }
@@ -302,7 +296,7 @@ async fn handle_incoming(
             };
             let text = serde_json::to_string(&response)?;
             outbound
-                .send(Message::Text(text.into()))
+                .send(Message::Text(text))
                 .map_err(|_| Error::Worker("cannot send call_tool response".into()))?;
         }
         other => {
@@ -314,7 +308,7 @@ async fn handle_incoming(
                 error: Some(json!({ "code": -32601, "message": "method not found" })),
             };
             let text = serde_json::to_string(&response)?;
-            let _ = outbound.send(Message::Text(text.into()));
+            let _ = outbound.send(Message::Text(text));
         }
     }
     Ok(())

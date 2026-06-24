@@ -40,8 +40,7 @@ impl HostExecutor {
 
         // Bind control server first to learn the actual port.
         let token = settings.control_token().to_string();
-        let server =
-            ControlServer::bind(&settings.control_bind, token.clone(), upstreams).await?;
+        let server = ControlServer::bind(&settings.control_bind, token.clone(), upstreams).await?;
         let addr = server.local_addr()?;
         let host = settings
             .control_host_for_worker
@@ -67,7 +66,11 @@ impl HostExecutor {
             .env("CODEMCP_SDK_DIR", &workdir)
             .env(
                 "CODEMCP_WS_AUTO_INSTALL",
-                if settings.ws_auto_install { "true" } else { "false" },
+                if settings.ws_auto_install {
+                    "true"
+                } else {
+                    "false"
+                },
             )
             .kill_on_drop(true);
         if let Some(v) = &settings.ws_version {
