@@ -10,6 +10,42 @@ Does routing an agent's tool calls through the codemcp gateway (one
 model tokens than binding the same N upstream tools directly (big per-turn
 schema)?
 
+A second question (the **shape-learning experiment**): when codemcp learns and
+surfaces each tool's *return shape* (`CODEMCP_LEARN_SHAPES`, the `codemcp_shapes`
+arm), does the model stop guessing nested field names — saving round-trips — by
+more than the shape lines cost in tokens?
+
+## Shape-learning experiment — result
+
+Run with three arms (`direct`, `codemcp`, `codemcp_shapes`) over six tasks
+(A–C shallow, D–F deeper / nested-field), 3 repeats = 54 runs, all answered.
+Headline (`codemcp_shapes` vs `codemcp`):
+
+| task | Δinput | Δturns | Δtools | effect |
+|---|---|---|---|---|
+| A, B, E | 0 | 0 | 0 | none — model didn't need the shape |
+| D | 0 | 0 | 0 | none — data was inline in the first result |
+| **C** | **−16,713** | **−1.33** | **−1.33** | shape removed a retry round-trip |
+| **F** | **−11,680** | **−1.00** | **−1.00** | shape removed a retry **and** fixed correctness (67% → 100%) |
+
+Two findings:
+
+1. **Where shape-guessing bites, shapes pay off.** On C and F — where the model
+   had to index into an unseen returned structure — a learned shape removed a
+   whole round-trip (fewer turns/tool calls) and cut input tokens (the saved
+   turn would have re-sent the conversation). On F, plain `codemcp` once flailed
+   for 6 turns and answered *wrong*; all three `codemcp_shapes` runs were a clean
+   3 turns and correct.
+2. **Zero steady-state cost.** On the tasks that didn't need shapes (A/B/D/E),
+   `Δinput` was **exactly 0** — confirming the lazy design: a shape is appended
+   only *after* a tool is first called, so the model's tool description is
+   unchanged until a shape is actually learned, and it only changes behavior
+   where shape-guessing was happening.
+
+Verdict: ship behind the flag (`CODEMCP_LEARN_SHAPES`, off by default). It is a
+strict improvement on nested-field tasks with no measurable downside on the
+others. Re-run below to reproduce; results drift slightly with live GitHub data.
+
 ## Design
 
 Two **arms**, identical except for how the GitHub MCP toolset reaches the model:
@@ -18,6 +54,7 @@ Two **arms**, identical except for how the GitHub MCP toolset reaches the model:
 |---|---|---|
 | `direct` | all ~45 GitHub MCP tools, bound directly | LangGraph `ToolNode` calls the GitHub MCP server |
 | `codemcp` | one `execute_python` tool (description = 45 two-line sigs) | agent writes Python; codemcp gateway routes SDK calls to the same GitHub MCP server |
+| `codemcp_shapes` | same as `codemcp`, plus a learned `# returns: {...}` line per tool *after its first call* | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
 
 Both arms bind the **same** upstream server (`ghcr.io/github/github-mcp-server`,
 github entry sourced from the user's codemcp `mcp.json`) and run the **same**
@@ -36,6 +73,14 @@ model on the **same** endpoint.
 | A | repo_count | 1 | `{"repo_count": int}` |
 | B | most_starred_latest_commit | 2 | `{"repo": str, "stars": int, "latest_commit_message": str}` |
 | C | most_issues_readme | 2 | `{"repo": str, "open_issues": int, "has_readme": bool}` |
+| D | most_starred_owner_and_language | 1–2 | `{"repo": str, "owner_type": str, "language": str}` |
+| E | latest_commit_author | 2 | `{"repo": str, "author_name": str, "commit_date": str}` |
+| F | most_issues_first_issue_author | 2 | `{"repo": str, "issue_number": int, "issue_author": str}` |
+
+Tasks **D–F require indexing into nested fields** of returned objects whose
+names are not obvious from the tool signature (`owner.type`, `commit.author.name`,
+`user.login`). They are where shape-guessing causes retries, isolating the value
+of the `codemcp_shapes` arm.
 
 Tasks let the agent take as many turns as it needs and answer in natural prose
 (no strict-JSON gate). Correctness is reviewed **manually** against

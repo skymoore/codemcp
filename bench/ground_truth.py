@@ -116,13 +116,17 @@ async def compute() -> dict[str, Any]:
         commits = _parse(commits_raw)
         commits_list = commits if isinstance(commits, list) else commits.get("items", [])
         latest_msg = ""
+        latest_author = ""
+        latest_date = ""
         if commits_list:
-            msg = (
-                commits_list[0].get("commit", {}).get("message", "")
-                or commits_list[0].get("message", "")
-                or ""
-            )
+            c0 = commits_list[0]
+            commit_obj = c0.get("commit", {}) if isinstance(c0, dict) else {}
+            msg = commit_obj.get("message", "") or c0.get("message", "") or ""
             latest_msg = msg.splitlines()[0] if msg else ""
+            # E: deeply nested author info (commit.author.name / .date).
+            author = commit_obj.get("author", {}) if isinstance(commit_obj, dict) else {}
+            latest_author = author.get("name", "") if isinstance(author, dict) else ""
+            latest_date = author.get("date", "") if isinstance(author, dict) else ""
 
         mi_full = most_issues["full_name"]
         mi_owner, mi_repo = mi_full.split("/", 1)
@@ -138,6 +142,36 @@ async def compute() -> dict[str, Any]:
             if isinstance(e, dict)
         )
 
+        # D: nested owner.type + repo.language on the most-starred repo object.
+        ms_owner_obj = most_starred.get("owner", {}) if isinstance(most_starred, dict) else {}
+        ms_owner_type = ms_owner_obj.get("type", "") if isinstance(ms_owner_obj, dict) else ""
+        ms_language = most_starred.get("language") or "none"
+
+        # F: lowest-numbered OPEN issue in the most-issues repo + its author login.
+        li = _find_tool(tools, "list_issues")
+        issues_raw = await li.ainvoke(
+            {"owner": mi_owner, "repo": mi_repo, "state": "OPEN", "perPage": 100}
+        )
+        issues = _parse(issues_raw)
+        # GitHub MCP returns {issues: [...], totalCount, pageInfo} for list_issues.
+        if isinstance(issues, list):
+            issues_list = issues
+        else:
+            issues_list = issues.get("issues") or issues.get("items") or []
+        # GitHub's list_issues can include PRs; keep only true issues when flagged.
+        issues_only = [
+            i
+            for i in issues_list
+            if isinstance(i, dict) and "pull_request" not in i
+        ] or [i for i in issues_list if isinstance(i, dict)]
+        first_issue_number = 0
+        first_issue_author = ""
+        if issues_only:
+            first = min(issues_only, key=lambda i: i.get("number", 1 << 30))
+            first_issue_number = int(first.get("number", 0))
+            user = first.get("user", {}) if isinstance(first, dict) else {}
+            first_issue_author = user.get("login", "") if isinstance(user, dict) else ""
+
         truth = {
             "A": {"repo_count": total_count},
             "B": {
@@ -149,6 +183,21 @@ async def compute() -> dict[str, Any]:
                 "repo": mi_full,
                 "open_issues": int(most_issues.get("open_issues_count", 0)),
                 "has_readme": bool(has_readme),
+            },
+            "D": {
+                "repo": ms_full,
+                "owner_type": ms_owner_type,
+                "language": ms_language,
+            },
+            "E": {
+                "repo": ms_full,
+                "author_name": latest_author,
+                "commit_date": latest_date,
+            },
+            "F": {
+                "repo": mi_full,
+                "issue_number": first_issue_number,
+                "issue_author": first_issue_author,
             },
         }
         return truth

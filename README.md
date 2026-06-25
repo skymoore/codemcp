@@ -593,6 +593,37 @@ against the SDK surface are. There is **zero** steady-state cost: the model's
 tool description is unchanged, and validation is invisible unless the code is
 actually broken.
 
+### Return shapes (`CODEMCP_LEARN_SHAPES`, opt-in)
+
+The flip side of pre-flight validation: even with valid calls, the model often
+has to *guess the structure of a return value* (`issue["user"]["login"]`) and
+pays a retry when it guesses wrong. Tool signatures advertise argument types but
+usually return `-> dict[str, Any]`, and declared `outputSchema`s are mostly
+absent (and far too verbose to show every turn).
+
+With `CODEMCP_LEARN_SHAPES=true`, the first successful call to each tool teaches
+the gateway the **shape** of what it actually returns, appended to that tool's
+entry in the `execute_python` description:
+
+```
+def github_get_me() -> dict[str, Any]:
+    # Get details of the authenticated user.
+    # returns: {avatar_url: str, details: {bio: str, followers: int, public_repos: int, ...}, id: int, login: str}
+```
+
+The shape is inferred from the real post-unwrap value (so it matches what the
+Python sees), and it is **bounded by construction** — depth-capped, fields-capped,
+arrays collapsed to one exemplar, hard length cap. It is a projection, not a
+schema: no descriptions, constraints, or enums, so it can't reimport the schema
+bloat it exists to avoid.
+
+It is **lazy and off by default**: a shape appears only *after* a tool has been
+called, so the steady-state tool list is unchanged and there is no cost unless
+the flag is set. In the [`bench/`](./bench) shape-learning experiment, surfacing
+shapes removed a full round-trip on nested-field tasks (−1 to −1.33 turns,
+−12k to −17k input tokens) and on one task fixed a wrong answer, with **exactly
+zero** token delta on tasks that didn't need it.
+
 ### Control channel
 
 The gateway runs a WebSocket server (loopback by default). The worker connects as
@@ -703,6 +734,12 @@ plus the variables below.
 |---|---|---|
 | `CODEMCP_EXEC_TIMEOUT_MS` | `30000` | Per-`run` execution timeout in milliseconds. |
 | `CODEMCP_MAX_OUTPUT_BYTES` | `1048576` | Max captured stdout/stderr bytes. |
+
+### Return shapes
+
+| Variable | Default | Description |
+|---|---|---|
+| `CODEMCP_LEARN_SHAPES` | `false` | Learn each tool's return shape on its first successful call and append it to that tool's entry in the `execute_python` description (`# returns: {...}`). Lazy and bounded; see [Return shapes](#return-shapes-codemcp_learn_shapes-opt-in). |
 
 ### Docker isolation
 

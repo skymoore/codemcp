@@ -30,7 +30,7 @@ SUMMARY_CSV = RESULTS_DIR / "summary.csv"
 from tasks import TASKS  # noqa: E402
 
 TASK_BY_ID = {t["id"]: t for t in TASKS}
-ARMS = ("direct", "codemcp")
+ARMS = ("direct", "codemcp", "codemcp_shapes")
 
 
 def _load_runs() -> list[dict[str, Any]]:
@@ -286,31 +286,53 @@ def _write_md(data: dict[str, Any]) -> None:
             )
     lines.append("")
 
-    lines.append("## deltas (codemcp vs direct)\n")
-    lines.append("negative = codemcp uses fewer; positive = codemcp uses more.\n")
-    lines.append("| task | Δinput | Δoutput | Δcache_r | Δcache_w | Δturns | Δtools | Δwall(s) |")
-    lines.append("|---|---|---|---|---|---|---|---|")
-    for task in TASKS:
-        d = by_key.get((task["id"], "direct"))
-        c = by_key.get((task["id"], "codemcp"))
-        if not d or not c or d.get("n", 0) == 0 or c.get("n", 0) == 0:
-            lines.append(f"| {task['id']} | – | – | – | – | – | – | – |")
-            continue
-
-        def delta(k):
-            return (c.get(k, 0) or 0) - (d.get(k, 0) or 0)
-
+    def _delta_table(base_arm: str, exp_arm: str, title: str, note: str) -> None:
+        lines.append(f"## deltas ({exp_arm} vs {base_arm})\n")
+        lines.append(note + "\n")
         lines.append(
-            f"| {task['id']} | "
-            f"{delta('input_mean'):+.0f} | "
-            f"{delta('output_mean'):+.0f} | "
-            f"{delta('cache_read_mean'):+.0f} | "
-            f"{delta('cache_creation_mean'):+.0f} | "
-            f"{delta('turns_mean'):+.2f} | "
-            f"{delta('tool_calls_mean'):+.2f} | "
-            f"{delta('wall_mean'):+.2f} |"
+            "| task | Δinput | Δoutput | Δcache_r | Δcache_w | Δturns | Δtools | Δwall(s) |"
         )
-    lines.append("")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for task in TASKS:
+            b = by_key.get((task["id"], base_arm))
+            e = by_key.get((task["id"], exp_arm))
+            if not b or not e or b.get("n", 0) == 0 or e.get("n", 0) == 0:
+                lines.append(f"| {task['id']} | – | – | – | – | – | – | – |")
+                continue
+
+            def delta(k):
+                return (e.get(k, 0) or 0) - (b.get(k, 0) or 0)
+
+            lines.append(
+                f"| {task['id']} | "
+                f"{delta('input_mean'):+.0f} | "
+                f"{delta('output_mean'):+.0f} | "
+                f"{delta('cache_read_mean'):+.0f} | "
+                f"{delta('cache_creation_mean'):+.0f} | "
+                f"{delta('turns_mean'):+.2f} | "
+                f"{delta('tool_calls_mean'):+.2f} | "
+                f"{delta('wall_mean'):+.2f} |"
+            )
+        lines.append("")
+
+    # codemcp vs direct — the original code-mode token comparison.
+    _delta_table(
+        "direct",
+        "codemcp",
+        "codemcp vs direct",
+        "negative = codemcp uses fewer; positive = codemcp uses more.",
+    )
+    # The shape-learning experiment headline: does surfacing learned return
+    # shapes change turns/tokens vs plain codemcp? Δturns < 0 means shapes saved
+    # round-trips (fewer shape-guessing retries); Δinput > 0 is the shape's cost.
+    _delta_table(
+        "codemcp",
+        "codemcp_shapes",
+        "codemcp_shapes vs codemcp (SHAPE-LEARNING EXPERIMENT)",
+        "negative Δturns / Δtools = shapes removed round-trips (fewer "
+        "shape-guessing retries); positive Δinput = the shape lines' token cost. "
+        "The experiment succeeds if shapes cut turns by more than they cost.",
+    )
 
     if err_runs:
         lines.append("## errored runs\n")

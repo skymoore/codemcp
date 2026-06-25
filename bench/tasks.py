@@ -8,6 +8,17 @@ designed to exercise a known number of dependent tool calls so the two arms
   B  - 2 tool calls (search -> list_commits; tests round-trip collapse)
   C  - 2 tool calls (search -> get_file_contents; tests collapse + transform)
 
+Deeper tasks (D/E/F) require indexing into NESTED fields of returned objects
+whose names are not obvious from the tool signature (`-> dict[str, Any]`). They
+are where shape-guessing bites: without a learned return shape the model must
+guess keys like `owner.type`, `commit.author.name`, or `user.login`, and a wrong
+guess costs a retry turn. These tasks isolate the value of the `codemcp_shapes`
+arm.
+
+  D  - 2 tool calls (search -> reuse repo object; nested owner/language fields)
+  E  - 2 tool calls (search -> list_commits; deeply nested commit.author fields)
+  F  - 2 tool calls (search -> list_issues; nested issue.user.login field)
+
 The agent is free to take as many turns as it needs and to answer in natural
 prose — no strict-JSON gate. Correctness is reviewed manually against
 ground_truth.json (analyze.py shows every final answer next to the truth and
@@ -63,6 +74,62 @@ TASKS = [
             "repo": str,
             "open_issues": int,
             "has_readme": bool,
+        },
+    },
+    {
+        "id": "D",
+        "name": "most_starred_owner_and_language",
+        "tool_calls_expected": 1,
+        "prompt": (
+            "Find the GitHub user `skymoore`'s most-starred public repository. "
+            "From that repository's data, report three things: the repository's "
+            "full name, the account type of its owner (e.g. User or Organization), "
+            "and its primary programming language. Take as many steps as you need. "
+            "When you have the answer, state it clearly and name each value "
+            "explicitly on its own line: `repo: owner/name`, `owner_type: User`, "
+            "`language: Rust`. If the primary language is not set, use `none`."
+        ),
+        "answer_keys": {
+            "repo": str,
+            "owner_type": str,
+            "language": str,
+        },
+    },
+    {
+        "id": "E",
+        "name": "latest_commit_author",
+        "tool_calls_expected": 2,
+        "prompt": (
+            "Find the GitHub user `skymoore`'s most-starred public repository, then "
+            "fetch its single most recent commit. Report the repository's full "
+            "name, the name of the person who authored that commit, and the date "
+            "of that commit. Take as many steps as you need. When you have the "
+            "answer, state it clearly and name each value explicitly on its own "
+            "line: `repo: owner/name`, `author_name: <name>`, `commit_date: <date>`."
+        ),
+        "answer_keys": {
+            "repo": str,
+            "author_name": str,
+            "commit_date": str,
+        },
+    },
+    {
+        "id": "F",
+        "name": "most_issues_first_issue_author",
+        "tool_calls_expected": 2,
+        "prompt": (
+            "Find the GitHub user `skymoore`'s repository with the most open "
+            "issues. Then list that repository's open issues and identify the one "
+            "with the lowest issue number. Report the repository's full name, that "
+            "issue's number, and the login (username) of the account that opened "
+            "it. Take as many steps as you need. When you have the answer, state it "
+            "clearly and name each value explicitly on its own line: "
+            "`repo: owner/name`, `issue_number: 12`, `issue_author: someuser`."
+        ),
+        "answer_keys": {
+            "repo": str,
+            "issue_number": int,
+            "issue_author": str,
         },
     },
 ]

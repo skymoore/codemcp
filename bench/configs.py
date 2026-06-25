@@ -111,7 +111,7 @@ def direct_mcp_config() -> dict[str, Any]:
     }
 
 
-def codemcp_mcp_config() -> dict[str, Any]:
+def codemcp_mcp_config(*, learn_shapes: bool = False) -> dict[str, Any]:
     """MultiServerMCPClient config: a fresh `codemcp` stdio gateway.
 
     The gateway is pointed at the bench-local mcp.github.json (only `github`
@@ -119,6 +119,11 @@ def codemcp_mcp_config() -> dict[str, Any]:
     GitHub tools the direct arm binds. `GITHUB_TOKEN` is inherited from
     os.environ (loaded from .env) so codemcp can interpolate `{env:GITHUB_TOKEN}`
     in mcp.github.json itself.
+
+    When `learn_shapes` is true, the gateway runs with `CODEMCP_LEARN_SHAPES=true`
+    so the first call to each tool teaches its return shape, which is then
+    appended to that tool's entry in the `execute_python` description. This is
+    the only difference between the `codemcp` and `codemcp_shapes` arms.
     """
     codemcp_bin = os.environ.get("CODEMCP_BIN", _resolve_codemcp_bin())
     env = {
@@ -128,6 +133,8 @@ def codemcp_mcp_config() -> dict[str, Any]:
         "CODEMCP_TRANSPORT": "stdio",
         "CODEMCP_LOG": "warn",
     }
+    if learn_shapes:
+        env["CODEMCP_LEARN_SHAPES"] = "true"
     # Guard: refuse to start if the token isn't visible to the gateway.
     if not env.get("GITHUB_TOKEN"):
         raise RuntimeError(
@@ -168,7 +175,7 @@ def load_zen_api_key() -> str:
     return key
 
 
-ARMS = ("direct", "codemcp")
+ARMS = ("direct", "codemcp", "codemcp_shapes")
 
 
 def mcp_config_for(arm: str) -> dict[str, Any]:
@@ -176,4 +183,6 @@ def mcp_config_for(arm: str) -> dict[str, Any]:
         return direct_mcp_config()
     if arm == "codemcp":
         return codemcp_mcp_config()
+    if arm == "codemcp_shapes":
+        return codemcp_mcp_config(learn_shapes=True)
     raise ValueError(f"unknown arm: {arm!r}")
