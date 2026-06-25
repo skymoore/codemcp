@@ -2,6 +2,7 @@
 //! generates the importable `sdk.py`, and exposes routing metadata.
 
 pub mod codegen;
+pub mod shape;
 pub mod summary;
 
 use std::collections::HashMap;

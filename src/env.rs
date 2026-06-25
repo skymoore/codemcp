@@ -94,6 +94,13 @@ pub struct Settings {
 
     /// Whether to check for updates on startup (default `"true"`).
     pub check_update: bool,
+
+    /// Learn and surface return shapes. When enabled, the first successful call
+    /// to each tool teaches the gateway the (size-bounded) shape of its return
+    /// value, which is then appended to that tool's entry in the
+    /// `execute_python` description so the model stops guessing field names.
+    /// Off by default — steady-state behavior is byte-identical when unset.
+    pub learn_shapes: bool,
 }
 
 impl Default for Settings {
@@ -128,6 +135,7 @@ impl Default for Settings {
             summary_cache: default_summary_cache(),
             log: "info".to_string(),
             check_update: true,
+            learn_shapes: false,
         }
     }
 }

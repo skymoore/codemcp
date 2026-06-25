@@ -33,7 +33,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures::StreamExt;
 
-use crate::control::{ControlHandle, RunOutput};
+use crate::control::{ControlHandle, RunOutput, ShapeSink};
 use crate::env::{self, Settings};
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
@@ -55,6 +55,7 @@ impl DockerExecutor {
         settings: &Settings,
         sdk_py: &str,
         upstreams: SharedUpstreams,
+        shapes: ShapeSink,
     ) -> Result<Self, Error> {
         // 1. Connect to the daemon (auto-detects Docker/Podman socket).
         let docker = Docker::connect_with_local_defaults().map_err(|e| {
@@ -73,7 +74,8 @@ impl DockerExecutor {
 
         // 3. Bind the control channel securely (platform-aware; see ChannelPlan).
         let token = settings.control_token().to_string();
-        let plan = bind_control_channel(settings, &gateway_ip, upstreams, token.clone()).await?;
+        let plan =
+            bind_control_channel(settings, &gateway_ip, upstreams, token.clone(), shapes).await?;
         let ControlChannel {
             server,
             control_url,
@@ -167,11 +169,13 @@ async fn bind_control_channel(
     gateway_ip: &str,
     upstreams: SharedUpstreams,
     token: String,
+    shapes: ShapeSink,
 ) -> Result<ControlChannel, Error> {
     // Honor an explicit override unconditionally.
     if let Some(host) = settings.control_host_for_worker.clone() {
         let server =
-            crate::control::ControlServer::bind(&settings.control_bind, token, upstreams).await?;
+            crate::control::ControlServer::bind(&settings.control_bind, token, upstreams, shapes)
+                .await?;
         let port = server.local_addr()?.port();
         return Ok(ControlChannel {
             server,
@@ -186,6 +190,7 @@ async fn bind_control_channel(
         &format!("{gateway_ip}:0"),
         token.clone(),
         upstreams.clone(),
+        shapes.clone(),
     )
     .await
     {
@@ -203,7 +208,8 @@ async fn bind_control_channel(
             // to loopback + host.docker.internal.
             tracing::debug!(error = %e, "bridge gateway unbindable; using loopback + host.docker.internal (docker desktop topology)");
             let server =
-                crate::control::ControlServer::bind("127.0.0.1:0", token, upstreams).await?;
+                crate::control::ControlServer::bind("127.0.0.1:0", token, upstreams, shapes)
+                    .await?;
             let port = server.local_addr()?.port();
             Ok(ControlChannel {
                 server,

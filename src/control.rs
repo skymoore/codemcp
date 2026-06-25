@@ -24,6 +24,56 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
 
+/// An observed tool-result value, emitted after a successful `call_tool` when
+/// shape-learning is enabled. The runtime consumes these to learn (once per
+/// tool) the shape of what a tool returns and surface it to the model.
+#[derive(Debug, Clone)]
+pub struct ShapeEvent {
+    pub server: String,
+    pub tool: String,
+    /// The post-unwrap value the worker's Python actually sees.
+    pub value: Value,
+}
+
+/// Sink for [`ShapeEvent`]s. `None` (the default) disables shape learning, so
+/// the `call_tool` path stays byte-identical when the feature is off.
+pub type ShapeSink = Option<mpsc::UnboundedSender<ShapeEvent>>;
+
+/// Reduce a serialized `CallToolResult` to the value the worker's Python sees.
+///
+/// Mirrors `pyworker/bootstrap.py::_unwrap_tool_result`: prefer
+/// `structuredContent`; else parse the joined text content as JSON; else fall
+/// back to the raw value. Keeping this in lockstep with the worker means the
+/// learned shape matches what the model will actually index into.
+fn unwrap_tool_result(result: &Value) -> Value {
+    let Some(obj) = result.as_object() else {
+        return result.clone();
+    };
+    if let Some(sc) = obj.get("structuredContent") {
+        if !sc.is_null() {
+            return sc.clone();
+        }
+    }
+    if let Some(Value::Array(content)) = obj.get("content") {
+        let mut texts = Vec::new();
+        for item in content {
+            if item.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(t) = item.get("text").and_then(Value::as_str) {
+                    texts.push(t);
+                }
+            }
+        }
+        if !texts.is_empty() {
+            let joined = texts.join("\n");
+            if let Ok(parsed) = serde_json::from_str::<Value>(&joined) {
+                return parsed;
+            }
+            return Value::String(joined);
+        }
+    }
+    result.clone()
+}
+
 /// Result of a `run` request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunOutput {
@@ -108,6 +158,7 @@ pub struct ControlServer {
     listener: TcpListener,
     token: String,
     upstreams: SharedUpstreams,
+    shapes: ShapeSink,
 }
 
 impl ControlServer {
@@ -115,6 +166,7 @@ impl ControlServer {
         bind_addr: &str,
         token: String,
         upstreams: SharedUpstreams,
+        shapes: ShapeSink,
     ) -> Result<Self, Error> {
         let listener = TcpListener::bind(bind_addr)
             .await
@@ -123,6 +175,7 @@ impl ControlServer {
             listener,
             token,
             upstreams,
+            shapes,
         })
     }
 
@@ -179,6 +232,7 @@ impl ControlServer {
 
         // Reader task: dispatch incoming frames (run responses + call_tool reqs).
         let upstreams = self.upstreams.clone();
+        let shapes = self.shapes.clone();
         let pending_reader = pending.clone();
         let outbound_for_reader = outbound_tx.clone();
         tokio::spawn(async move {
@@ -203,8 +257,10 @@ impl ControlServer {
                 if is_call_tool(&text) {
                     let upstreams = upstreams.clone();
                     let outbound = outbound_for_reader.clone();
+                    let shapes = shapes.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_call_tool(&text, &upstreams, &outbound).await {
+                        if let Err(e) = handle_call_tool(&text, &upstreams, &outbound, &shapes).await
+                        {
                             tracing::warn!(error = %e, "error handling call_tool frame");
                         }
                     });
@@ -312,6 +368,7 @@ async fn handle_call_tool(
     text: &str,
     upstreams: &SharedUpstreams,
     outbound: &mpsc::UnboundedSender<Message>,
+    shapes: &ShapeSink,
 ) -> Result<(), Error> {
     let msg: Value = serde_json::from_str(text)?;
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -324,6 +381,22 @@ async fn handle_call_tool(
     {
         Ok(result) => {
             let value = serde_json::to_value(&result).unwrap_or(Value::Null);
+            // Emit the (unwrapped) result shape for learning. Best-effort and
+            // non-blocking: a closed/absent sink is simply ignored. Skip results
+            // the upstream marked as errors so we don't learn an error shape.
+            if let Some(tx) = shapes {
+                let is_error = value
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !is_error {
+                    let _ = tx.send(ShapeEvent {
+                        server: params.server.clone(),
+                        tool: params.tool.clone(),
+                        value: unwrap_tool_result(&value),
+                    });
+                }
+            }
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,

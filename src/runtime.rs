@@ -92,6 +92,10 @@ struct Inner {
     /// Pending OAuth login flows, keyed by server name. Populated by
     /// `auth_start`, consumed by `auth_finish`.
     pending_oauth: Mutex<HashMap<String, LoginHandle>>,
+    /// Learned return shapes, keyed by (server, tool). Populated lazily by the
+    /// shape-learning consumer task on the first successful call to each tool;
+    /// surfaced in the `execute_python` description. Empty when learning is off.
+    shapes: Mutex<BTreeMap<(String, String), String>>,
 }
 
 #[derive(Clone)]
@@ -108,6 +112,7 @@ impl Runtime {
         config_path: PathBuf,
         launcher: Launcher,
         sdk: SdkState,
+        shape_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::control::ShapeEvent>>,
     ) -> Result<Self, Error> {
         let boot_list = config::load_all(&config_path)?;
         let mut boot = BTreeMap::new();
@@ -124,7 +129,7 @@ impl Runtime {
                 },
             );
         }
-        Ok(Self {
+        let runtime = Self {
             inner: Arc::new(Inner {
                 upstreams,
                 executor,
@@ -137,8 +142,55 @@ impl Runtime {
                 tool_defaults: Mutex::new(tool_defaults),
                 tool_session: Mutex::new(BTreeMap::new()),
                 pending_oauth: Mutex::new(HashMap::new()),
+                shapes: Mutex::new(BTreeMap::new()),
             }),
-        })
+        };
+
+        // Spawn the shape-learning consumer if the channel is wired.
+        if let Some(rx) = shape_rx {
+            runtime.clone().spawn_shape_learner(rx);
+        }
+
+        Ok(runtime)
+    }
+
+    /// Consume observed tool-result values and learn each tool's return shape on
+    /// first sight. On a newly-learned shape, regenerate the SDK description (so
+    /// the shape is appended to that tool's entry) and notify clients.
+    fn spawn_shape_learner(
+        self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::control::ShapeEvent>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let key = (ev.server.clone(), ev.tool.clone());
+                // Only the first successful call per tool teaches a shape.
+                {
+                    let shapes = self.inner.shapes.lock().await;
+                    if shapes.contains_key(&key) {
+                        continue;
+                    }
+                }
+                let Some(shape) = crate::sdk::shape::infer(&ev.value) else {
+                    // Scalar/empty result: nothing useful to teach. Record an
+                    // empty marker so we don't re-infer on every later call.
+                    self.inner.shapes.lock().await.insert(key, String::new());
+                    continue;
+                };
+                {
+                    let mut shapes = self.inner.shapes.lock().await;
+                    // Re-check under the write lock (another event may have raced).
+                    if shapes.contains_key(&key) {
+                        continue;
+                    }
+                    shapes.insert(key, shape);
+                }
+                // Surface the new shape to the model.
+                if let Err(e) = self.regenerate_and_reload().await {
+                    tracing::warn!(error = %e, "shape learn: regenerate failed");
+                }
+            }
+        });
     }
 
     /// The config path this gateway was started with.
@@ -330,7 +382,8 @@ impl Runtime {
             .collect();
         let registry = SdkRegistry::build(&filtered);
         let sdk_py = registry.generate_sdk_py();
-        let description = prompt::build_description(&registry, self.inner.isolation);
+        let shapes = self.inner.shapes.lock().await.clone();
+        let description = prompt::build_description(&registry, self.inner.isolation, &shapes);
 
         // Hot-reload the worker's SDK module.
         self.inner.executor.reload_sdk(&sdk_py).await?;
