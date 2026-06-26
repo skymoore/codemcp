@@ -169,6 +169,89 @@ result = github_search_issues(**opts)
     check("executed, no error", error is None, repr(error))
     check("returned value", result == {"ok": True}, repr(result))
 
+    # ── 9. strict return-field validation (keysets shipped by the gateway) ──
+    # Serialized KeySet form (matches src/sdk/keyset.rs serde):
+    #   object -> {"k":"object","fields":{name: <keyset>, ...}}
+    #   array  -> {"k":"array","items":<keyset>}
+    #   leaf   -> {"k":"leaf"}
+    def obj(**fields):
+        return {"k": "object", "fields": fields}
+
+    def arr(items):
+        return {"k": "array", "items": items}
+
+    LEAF = {"k": "leaf"}
+    keysets = {
+        # github_search_issues returns {issues: [{number, title, user: {login, id}}], totalCount}
+        "github_search_issues": obj(
+            issues=arr(obj(number=LEAF, title=LEAF, user=obj(login=LEAF, id=LEAF))),
+            totalCount=LEAF,
+        ),
+        # github_get_pull_request returns {number, title, user: {login, id}}
+        "github_get_pull_request": obj(
+            number=LEAF, title=LEAF, user=obj(login=LEAF, id=LEAF)
+        ),
+    }
+
+    def Vf(code):
+        return V(code, sdk, keysets)
+
+    print("9. strict return-field validation")
+
+    print("9a. valid top-level field passes")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nresult = pr['title']")
+    check("valid field not flagged", err is None, repr(err))
+
+    print("9b. typo in top-level field is flagged with suggestion")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nresult = pr['titel']")
+    check("flagged", err is not None, repr(err))
+    check("suggests `title`", err and "title" in err, repr(err))
+    check("not executed wording", err and "no field" in err, repr(err))
+
+    print("9c. attribute-style typo is flagged")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nresult = pr.titel")
+    check("flagged", err is not None, repr(err))
+
+    print("9d. nested valid field passes")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nresult = pr['user']['login']")
+    check("nested valid not flagged", err is None, repr(err))
+
+    print("9e. nested typo is flagged")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nresult = pr['user']['lgoin']")
+    check("flagged", err is not None, repr(err))
+    check("suggests `login`", err and "login" in err, repr(err))
+
+    print("9f. dynamic/non-literal access is NOT flagged")
+    err = Vf("pr = github_get_pull_request('o', 'r', 1)\nk='x'\nresult = pr[k]")
+    check("variable subscript not flagged", err is None, repr(err))
+
+    print("9g. cold tool (no keyset) is NOT flagged")
+    err = Vf("x = github_create_issue('o','r','t')\nresult = x['nope']")
+    check("no keyset -> no check", err is None, repr(err))
+
+    print("9h. reassigned/poisoned name is NOT flagged")
+    err = Vf(
+        "pr = github_get_pull_request('o','r',1)\npr = {'whatever': 1}\nresult = pr['titel']"
+    )
+    check("poisoned name not validated", err is None, repr(err))
+
+    print("9i. array element field via index is NOT over-validated")
+    # pr['issues'] is an array; indexing it then accessing a field is not a
+    # literal-object access we descend into, so it must not be flagged.
+    err = Vf(
+        "r = github_search_issues(query='x')\nresult = r['issues'][0]['number']"
+    )
+    check("array element access not flagged", err is None, repr(err))
+
+    print("9j. typo on the array container key IS flagged")
+    err = Vf("r = github_search_issues(query='x')\nresult = r['issuez']")
+    check("flagged", err is not None, repr(err))
+    check("suggests `issues`", err and "issues" in err, repr(err))
+
+    print("9k. no keysets at all -> field checking inert")
+    err = V("pr = github_get_pull_request('o','r',1)\nresult = pr['titel']", sdk, None)
+    check("None keysets -> no field check", err is None, repr(err))
+
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} check(s): {', '.join(FAILS)}")

@@ -603,47 +603,69 @@ pays a retry when it guesses wrong. Tool signatures advertise argument types but
 usually return `-> dict[str, Any]`, and declared `outputSchema`s are mostly
 absent (and far too verbose to show every turn).
 
-With `CODEMCP_LEARN_SHAPES=true`, the first successful call to each tool teaches
-the gateway the **shape** of what it actually returns, appended to that tool's
-entry in the `execute_python` description:
+With `CODEMCP_LEARN_SHAPES=true`, each successful tool call teaches the gateway
+the structure of what it actually returns. That knowledge is used through **two
+independent tiers**, each off by default and together gated by the one flag.
+
+**Tier 1 — strict pre-flight field validation (works with every client).**
+This is the high-leverage path. The gateway retains the *full* nested key
+structure of each tool's return value — uncapped, unioned across observed entity
+variants (e.g. GitHub User vs Organization), and seeded from any declared
+`outputSchema` so even the first call is covered — and ships it to the worker.
+The pre-flight validator then rejects a wrong literal field access *before
+executing*, the same way it already rejects a bad argument:
+
+```
+result = github_get_me()
+login = result["lgoin"]      # ← rejected, not executed:
+# github_get_me: result has no field `lgoin` (line 2). Did you mean `login`?
+```
+
+This turns a wasted round-trip (run → `KeyError` traceback → retry on a more
+expensive turn) into a precise same-turn correction. Because it rides the
+**worker**, not the tool list, it reaches the model on every turn regardless of
+client behavior, has **no prompt-cache impact**, and the full key structure
+**never enters the model's context**. It is conservative by construction: only
+simple `x = tool(...)` bindings are tracked, only literal `x["k"]` / `x.k` access
+is checked, and anything dynamic, reassigned, or not-yet-learned is left alone.
+
+**Tier 2 — lossy shape in the description (discovery; client-dependent).**
+The first call also learns a small, size-bounded exemplar appended to that tool's
+entry in the `execute_python` description, so the model can *discover* field
+names up front:
 
 ```
 def github_get_me() -> dict[str, Any]:
     # Get details of the authenticated user.
-    # returns: {avatar_url: str, details: {bio: str, followers: int, public_repos: int, ...}, id: int, login: str}
+    # returns: {avatar_url: str, details: {bio: str, followers: int, ...}, id: int, login: str}
 ```
 
-The shape is inferred from the real post-unwrap value (so it matches what the
-Python sees), and it is **bounded by construction** — depth-capped, fields-capped,
-arrays collapsed to one exemplar, hard length cap. It is a projection, not a
-schema: no descriptions, constraints, or enums, so it can't reimport the schema
-bloat it exists to avoid.
+This exemplar is **bounded by construction** (depth-capped, fields-capped, arrays
+collapsed to one element, hard length cap) — a projection, not a schema, so it
+can't reimport the bloat it exists to avoid.
 
-It is **lazy and off by default**: a shape appears only *after* a tool has been
-called, so the steady-state tool list is unchanged and there is no cost unless
-the flag is set.
-
-> **Scope (measured — see [`bench/`](./bench)):** a learned shape only reaches
-> the model on a *subsequent* `tools/list`, so whether it helps depends entirely
-> on the **client's** tool-listing lifecycle — not on MCP, the transport, or the
-> gateway:
+> **Scope of Tier 2 (measured — see [`bench/`](./bench)):** a learned *description*
+> shape only reaches the model on a *subsequent* `tools/list`, so its usefulness
+> depends on the **client's** tool-listing lifecycle — not on MCP, the transport,
+> or the gateway:
 > - **Snapshot-once clients** (most, e.g. `langchain-mcp-adapters`) list tools
 >   once and ignore `tools/list_changed`, so the session never sees the shape it
 >   learned — a no-op, but with **no prompt-cache downside** (the cached prefix is
 >   never mutated).
-> - **Spec-compliant clients** that re-list on `tools/list_changed` *do* see the
->   shape mid-session (bench arm `codemcp_shapes_relist`, verified) — but in the
->   bench this bought **no reliable turn saving** and **did bust the prompt cache**
->   (re-listing mutates the cached tool-schema prefix: ~+4.3k `cache_creation`,
->   ~−4.3k `cache_read` per task).
-> - Shapes do reach **later sessions of a shared `codemcp start` HTTP gateway**
->   (verified) — a real but cross-session-only benefit.
+> - **Spec-compliant clients** that re-list *do* see it mid-session (bench arm
+>   `codemcp_shapes_relist`, verified) — but that bought **no reliable turn
+>   saving** and **did bust the prompt cache** (~+4.3k `cache_creation`, ~−4.3k
+>   `cache_read` per task as the tool-schema prefix is re-created).
+> - It does reach **later sessions of a shared `codemcp start` HTTP gateway** —
+>   a real but cross-session-only benefit.
 >
-> Hence: **off by default.** Either the client can't see the shape (no-op) or it
-> pays a cache cost to see it with no measured payoff. The promising fix is to
-> surface shapes through a channel that needs no re-list and mutates no cached
-> prefix — **inline in the tool *result***, which every client always feeds back
-> to the model — rather than via a description the client must re-read.
+> Tier 1 (validation) has **none** of these caveats: it works with every client
+> on every turn and never touches the cache. That's why the validation tier is
+> the reason to enable shape-learning; the description tier is a bonus where the
+> client lifecycle allows it.
+
+Both tiers are **lazy and off by default**: nothing is learned, shipped, or shown
+unless the flag is set, and the steady-state tool list is unchanged.
 
 ### Control channel
 

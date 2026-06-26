@@ -230,8 +230,15 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
             description,
         },
         shape_rx,
+        settings.shapes_in_description,
     )
     .await?;
+
+    // When shape-learning is on, seed the worker's return-field validator with
+    // any declared outputSchemas now (learned shapes refine it on first calls).
+    if settings.learn_shapes {
+        runtime.seed_worker_validation().await;
+    }
 
     // For HTTP, bind the TCP listener *before* starting the admin server, so a
     // port conflict fails fast without leaving a stale admin socket behind.

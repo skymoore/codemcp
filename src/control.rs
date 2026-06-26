@@ -150,6 +150,35 @@ impl ControlHandle {
         }
         Ok(())
     }
+
+    /// Push the validation keyset map (`fn_name -> KeySet`, as JSON) to the
+    /// worker. The worker stores it and uses it for strict pre-flight field
+    /// validation. Awaits the worker's ack.
+    pub async fn set_shapes(&self, shapes_json: Value) -> Result<(), Error> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "set_shapes",
+            "params": { "shapes": shapes_json }
+        });
+        self.outbound
+            .send(Message::Text(msg.to_string()))
+            .map_err(|_| Error::Worker("worker connection closed".into()))?;
+
+        let out = rx
+            .await
+            .map_err(|_| Error::Worker("worker dropped set_shapes request".into()))??;
+        if let Some(err) = out.error {
+            return Err(Error::Worker(format!("worker set_shapes failed: {err}")));
+        }
+        Ok(())
+    }
 }
 
 /// The control server. Bind first to learn the actual port, then accept one

@@ -406,6 +406,17 @@ impl super::Executor for DockerExecutor {
         self.handle.reload(sdk_py).await
     }
 
+    async fn set_shapes(
+        &self,
+        keysets: &std::collections::BTreeMap<String, crate::sdk::keyset::KeySet>,
+    ) -> Result<(), Error> {
+        // Shipped over the control channel (not the read-only mount), so this
+        // works identically to the host backend.
+        let json = serde_json::to_value(keysets)
+            .map_err(|e| Error::Worker(format!("serialize keysets: {e}")))?;
+        self.handle.set_shapes(json).await
+    }
+
     async fn shutdown(&self) {
         if let Err(e) = remove_container(&self.docker, &self.container_id).await {
             tracing::warn!(error = %e, "failed to remove worker container during shutdown");

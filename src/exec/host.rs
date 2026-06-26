@@ -114,6 +114,15 @@ impl super::Executor for HostExecutor {
         self.handle.reload(sdk_py).await
     }
 
+    async fn set_shapes(
+        &self,
+        keysets: &std::collections::BTreeMap<String, crate::sdk::keyset::KeySet>,
+    ) -> Result<(), Error> {
+        let json = serde_json::to_value(keysets)
+            .map_err(|e| Error::Worker(format!("serialize keysets: {e}")))?;
+        self.handle.set_shapes(json).await
+    }
+
     async fn shutdown(&self) {
         // Dropping the child (kill_on_drop) handles teardown.
     }

@@ -422,11 +422,15 @@ def _validate_call(node, fn_name, fn, errors):
             )
 
 
-def _validate_user_code(code, sdk_module):
+def _validate_user_code(code, sdk_module, keysets=None):
     """Statically validate `code` against the SDK contract.
 
     Returns ``None`` if the code passes the pre-flight checks, otherwise a
     structured, human-readable error string describing each problem found.
+
+    `keysets` is the optional `fn_name -> KeySet` validation map shipped by the
+    gateway; when present, literal field access on values returned by SDK calls
+    is strictly checked against the learned/declared key structure.
     """
     # 1. Syntax.
     try:
@@ -473,6 +477,10 @@ def _validate_user_code(code, sdk_module):
                 )
             )
 
+    # 2. Strict return-field validation (only when the gateway shipped keysets).
+    if keysets:
+        _validate_field_access(tree, sdk_fns, keysets, errors)
+
     if not errors:
         return None
 
@@ -483,11 +491,158 @@ def _validate_user_code(code, sdk_module):
     return header + "\n".join(f"  - {e}" for e in errors)
 
 
-def _exec_user_code(code, sdk_module, dispatcher):
+# ── return-field validation ──────────────────────────────────
+#
+# Track variables assigned directly from an SDK call (`x = github_get_me(...)`)
+# and strictly check literal field access on them (`x["lgoin"]`, `x.lgoin`,
+# nested `x["user"]["lgoin"]`) against the full key structure the gateway
+# learned/declared for that tool. Because the keyset is COMPLETE (no field caps,
+# unioned across observed variants), "key not present" is a trustworthy signal,
+# so we hard-flag it with a difflib suggestion — same UX as the kwarg check.
+#
+# Conservative by construction: only simple `name = sdk_fn(...)` bindings are
+# tracked; only literal subscripts/attributes are descended; the moment a chain
+# hits a non-object node, an unknown key, dynamic access, or array indexing we
+# stop. A tracked name that is reassigned or whose binding we can't prove is
+# dropped from tracking.
+
+
+def _keyset_kind(ks):
+    return ks.get("k") if isinstance(ks, dict) else None
+
+
+def _keyset_descend(ks, key):
+    """Return the child KeySet for `key`, or None if `key` is not a valid field.
+
+    Returns the sentinel ("__leaf__", None) semantics via two channels:
+      - (True, child)  -> `key` is valid; `child` is its KeySet (may be leaf)
+      - (False, keys)  -> `key` is NOT valid; `keys` is the list of valid keys
+      - (None, None)   -> cannot decide here (not an object / opaque); skip
+    """
+    kind = _keyset_kind(ks)
+    if kind != "object":
+        # Arrays and leaves can't be validated by a literal string key.
+        return (None, None)
+    fields = ks.get("fields") or {}
+    if not isinstance(fields, dict) or not fields:
+        return (None, None)
+    if key in fields:
+        return (True, fields[key])
+    return (False, list(fields.keys()))
+
+
+def _literal_access_chain(node):
+    """Peel a chain of literal subscripts/attributes off the OUTERMOST expr.
+
+    Given an AST node that is the *target* of access (e.g. the whole
+    `x["user"]["login"]`), return `(root_name, [keys...])` where root_name is the
+    base `ast.Name` id and keys is the ordered list of literal string keys.
+    Returns (None, None) if the chain isn't a pure literal access on a Name.
+    """
+    keys = []
+    cur = node
+    while True:
+        if isinstance(cur, ast.Subscript):
+            sl = cur.slice
+            # Py3.9+: slice is the expression directly.
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                keys.append(sl.value)
+                cur = cur.value
+                continue
+            return (None, None)  # non-literal / numeric / slice -> bail
+        if isinstance(cur, ast.Attribute):
+            keys.append(cur.attr)
+            cur = cur.value
+            continue
+        if isinstance(cur, ast.Name):
+            keys.reverse()
+            return (cur.id, keys)
+        return (None, None)
+
+
+def _validate_field_access(tree, sdk_fns, keysets, errors):
+    # var -> fn_name, for `name = sdk_fn(...)` single-target assignments.
+    # If a name is EVER assigned to a non-SDK value (anywhere in the snippet), we
+    # refuse to track it: we can't prove which binding a given access refers to
+    # without flow analysis, so we stay silent rather than risk a false positive.
+    sdk_bindings = {}  # var -> fn_name (last SDK-call assignment)
+    non_sdk_assigned = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        var = node.targets[0].id
+        val = node.value
+        if (
+            isinstance(val, ast.Call)
+            and isinstance(val.func, ast.Name)
+            and val.func.id in sdk_fns
+            and val.func.id in keysets
+        ):
+            sdk_bindings[var] = val.func.id
+        else:
+            non_sdk_assigned.add(var)
+
+    tracked = {
+        var: fn for var, fn in sdk_bindings.items() if var not in non_sdk_assigned
+    }
+    if not tracked:
+        return
+
+    # Nodes that are the `.value` of an enclosing access are inner links of a
+    # larger chain; only validate the OUTERMOST node of each chain so a nested
+    # access like x["user"]["login"] is checked once, not once per link.
+    inner = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Subscript, ast.Attribute)):
+            inner.add(id(n.value))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Subscript, ast.Attribute)):
+            continue
+        if id(node) in inner:
+            continue  # not the outermost link of its chain
+        root, keys = _literal_access_chain(node)
+        if root is None or root not in tracked or not keys:
+            continue
+
+        fn_name = tracked[root]
+        ks = keysets.get(fn_name)
+        lineno = getattr(node, "lineno", 0)
+        # Descend key by key; stop at first undecidable or invalid step.
+        for depth, key in enumerate(keys):
+            ok, info = _keyset_descend(ks, key)
+            if ok is None:
+                break  # can't validate here (array/leaf/opaque) -> stop
+            if ok is False:
+                valid = info
+                where = f"(line {lineno})"
+                near = difflib.get_close_matches(key, valid, n=1, cutoff=_SUGGEST_CUTOFF)
+                path = "".join(f"[{k!r}]" for k in keys[:depth]) or "result"
+                hint = (
+                    f"Did you mean `{near[0]}`?"
+                    if near
+                    else f"Available fields: {', '.join(valid)}."
+                )
+                errors.append(
+                    _format_call_error(
+                        fn_name,
+                        f"result{('' if path == 'result' else path)} has no field "
+                        f"`{key}` {where}.",
+                        hint,
+                    )
+                )
+                break
+            ks = info  # descend
+
+
+def _exec_user_code(code, sdk_module, dispatcher, keysets=None):
     """Execute user code, returning (result, stdout, stderr, error)."""
     # Pre-flight: reject statically-broken code before running anything, so the
     # model gets a precise hint instead of a post-hoc traceback.
-    validation_error = _validate_user_code(code, sdk_module)
+    validation_error = _validate_user_code(code, sdk_module, keysets)
     if validation_error is not None:
         return None, "", "", validation_error
 
@@ -539,6 +694,10 @@ class SdkHolder:
     def __init__(self, module, sdk_dir):
         self.module = module
         self.sdk_dir = sdk_dir
+        # fn_name -> KeySet dict (the serialized form shipped by the gateway),
+        # used for strict pre-flight return-field validation. Empty when the
+        # shape-learning feature is off.
+        self.keysets = {}
 
     def reload(self, source):
         """Overwrite sdk.py with `source` and re-import the module.
@@ -594,6 +753,8 @@ async def main():
                 asyncio.create_task(_handle_run(ws, msg, holder, dispatcher))
             elif method == "reload":
                 await _handle_reload(ws, msg, holder)
+            elif method == "set_shapes":
+                await _handle_set_shapes(ws, msg, holder)
             elif method is None:
                 # A response to one of our call_tool requests.
                 await dispatcher.handle_response(msg)
@@ -615,12 +776,34 @@ async def _handle_reload(ws, msg, holder):
     await ws.send(json.dumps(response))
 
 
+async def _handle_set_shapes(ws, msg, holder):
+    """Store the gateway's `fn_name -> KeySet` validation map on the holder.
+
+    The map is used by the pre-flight validator to strictly check literal field
+    access on values returned by SDK calls. Replacing wholesale each push keeps
+    the worker's view in lockstep with the gateway's accumulated knowledge.
+    """
+    rid = msg.get("id")
+    error = None
+    try:
+        shapes = msg.get("params", {}).get("shapes", {})
+        holder.keysets = shapes if isinstance(shapes, dict) else {}
+    except Exception:
+        error = traceback.format_exc()
+    response = {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "result": {"result": None, "stdout": "", "stderr": "", "error": error},
+    }
+    await ws.send(json.dumps(response))
+
+
 async def _handle_run(ws, msg, holder, dispatcher):
     code = msg.get("params", {}).get("code", "")
     rid = msg.get("id")
     # Run user code off the event loop so SDK calls can round-trip.
     result_value, stdout, stderr, error = await asyncio.to_thread(
-        _exec_user_code, code, holder.module, dispatcher
+        _exec_user_code, code, holder.module, dispatcher, holder.keysets
     )
     response = {
         "jsonrpc": "2.0",

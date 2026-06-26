@@ -21,6 +21,9 @@ pub struct PyBinding {
     pub signature: String,
     /// Ordered parameter names as they appear in the MCP schema (for arg mapping).
     pub params: Vec<ParamSpec>,
+    /// Key structure derived from the tool's declared `outputSchema`, if any.
+    /// Used to seed return-field validation before any value is observed.
+    pub output_keyset: Option<crate::sdk::keyset::KeySet>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +209,10 @@ pub fn build_binding(
     let ret = return_type(output_schema);
     let signature = format!("def {fn_name}({}) -> {ret}:", sig_params.join(", "));
 
+    // Seed a validation key structure from the declared outputSchema (if any), so
+    // the first call to a tool can be field-checked before a value is observed.
+    let output_keyset = output_schema.map(crate::sdk::keyset::KeySet::from_output_schema);
+
     PyBinding {
         fn_name,
         server: server.to_string(),
@@ -213,6 +220,7 @@ pub fn build_binding(
         summary: summary.to_string(),
         signature,
         params,
+        output_keyset,
     }
 }
 

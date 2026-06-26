@@ -95,12 +95,35 @@ pub struct Settings {
     /// Whether to check for updates on startup (default `"true"`).
     pub check_update: bool,
 
-    /// Learn and surface return shapes. When enabled, the first successful call
-    /// to each tool teaches the gateway the (size-bounded) shape of its return
-    /// value, which is then appended to that tool's entry in the
-    /// `execute_python` description so the model stops guessing field names.
-    /// Off by default — steady-state behavior is byte-identical when unset.
+    /// Learn return shapes and use them two ways. Off by default — the
+    /// `call_tool` path and worker behavior are byte-identical when unset.
+    ///
+    /// When enabled, each successful tool call teaches the gateway the structure
+    /// of that tool's return value, surfaced through **two independent tiers**:
+    ///
+    /// 1. **Description tier (lossy).** The first call learns a small,
+    ///    size-bounded exemplar (`# returns: {...}`) appended to that tool's
+    ///    entry in the `execute_python` description, so the model can *discover*
+    ///    field names. Caveat: this only reaches the model on a subsequent
+    ///    `tools/list`. Snapshot-once clients (most, e.g. langchain-mcp-adapters)
+    ///    never re-read it within a session — they see it only in a later session
+    ///    of a shared HTTP gateway. Clients that honor `tools/list_changed` do
+    ///    re-read it, but pay a prompt-cache re-creation cost (the cached
+    ///    tool-schema prefix changes). See `bench/` for the measurements.
+    /// 2. **Validation tier (full).** The *complete* nested key structure
+    ///    (uncapped, unioned across observed entity variants, and seeded from any
+    ///    declared `outputSchema`) is shipped to the worker and used for STRICT
+    ///    pre-flight validation of literal field access: `result["lgoin"]` is
+    ///    rejected before execution with a `did you mean` hint. This tier reaches
+    ///    every client on every turn (it rides the worker, not the tool list),
+    ///    has no prompt-cache impact, and never appears in the model's context.
     pub learn_shapes: bool,
+
+    /// Whether the lossy shape is appended to the `execute_python` description
+    /// (Tier 1 above). Default `true`. Set false to run *only* the validation
+    /// tier — useful to isolate the two tiers' effects (the bench's
+    /// `codemcp_validate` arm does this). No effect unless `learn_shapes` is on.
+    pub shapes_in_description: bool,
 }
 
 impl Default for Settings {
@@ -136,6 +159,7 @@ impl Default for Settings {
             log: "info".to_string(),
             check_update: true,
             learn_shapes: false,
+            shapes_in_description: true,
         }
     }
 }
