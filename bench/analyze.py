@@ -339,6 +339,23 @@ def _write_md(data: dict[str, Any]) -> None:
     # mid-session) vs the snapshot-once client (codemcp_shapes). If shapes have
     # ANY within-session value, it shows up HERE — the compliant client is the
     # only one that can see a shape learned in its own session.
+    # FIELD-VALIDATION experiment: codemcp_validate runs strict pre-flight field
+    # checking (Tier 1) WITHOUT the description shape, so it works with the
+    # default snapshot-once client and has no cache impact. A wrong field guess is
+    # rejected before execution, ideally cutting a wasted round-trip on the
+    # nested-field tasks (D-F). Compared against plain codemcp (no shapes at all).
+    val_rows = [r for r in rows if r["arm"] == "codemcp_validate" and r.get("n")]
+    if val_rows:
+        _delta_table(
+            "codemcp",
+            "codemcp_validate",
+            "codemcp_validate vs codemcp (FIELD-VALIDATION EXPERIMENT)",
+            "Strict pre-flight field validation only (no description shape, works "
+            "with every client, no cache impact). negative Δturns = a wrong field "
+            "guess was rejected pre-flight instead of costing a run+retry. Δcache_* "
+            "should be ~0 (the description is unchanged).",
+        )
+
     rl_rows = [r for r in rows if r["arm"] == "codemcp_shapes_relist" and r.get("n")]
     if rl_rows:
         avg_relist = _mean([r.get("relisted_mean", 0) for r in rl_rows])

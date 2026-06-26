@@ -22,6 +22,13 @@ spec-compliant about `tools/list_changed` — it re-lists and re-binds tools
 mid-session — and ask whether *that* client can turn a learned shape into a
 within-session saving.
 
+A fourth question (the **field-validation experiment**, the `codemcp_validate`
+arm): instead of *showing* the model a shape, use the learned full key structure
+to **reject a wrong field access pre-flight** (`result["lgoin"]` → error before
+execution, with a suggestion). This rides the worker, not the tool list, so it
+works with every client and never touches the prompt cache. Does catching wrong
+guesses before they execute cut wasted round-trips?
+
 ## Shape-learning experiment — result (corrected)
 
 Four arms (`direct`, `codemcp`, `codemcp_shapes`, `codemcp_shapes_relist`), six
@@ -138,10 +145,52 @@ surfacing shapes through a channel that needs no re-list and mutates no cached
 prefix: **inline in the tool result**, which every client always feeds back to
 the model. That avoids both failure modes this experiment exposed.
 
+## Field-validation experiment — result
+
+The `codemcp_validate` arm takes the **other** path to the same goal: instead of
+*showing* the model a shape, it uses the learned full key structure to **reject a
+wrong field access before execution** (`result["lgoin"]` → pre-flight error with
+a `did you mean "login"?` hint). This rides the worker, so it works with the
+default snapshot-once client and never touches the prompt cache. (Run with
+`CODEMCP_SHAPES_IN_DESCRIPTION=false`, so it isolates validation from the
+description tier.)
+
+**What the mechanism does (verified e2e, separately from the bench):** a real
+wrong-field guess *is* rejected pre-flight against a live GitHub result — first
+call learns the keyset, `github_get_me()["lgoin"]` is refused with the suggestion,
+`["login"]` runs. The plumbing works end-to-end.
+
+**What the bench measured (90 runs, OpenRouter `claude-sonnet-4.6`, caching on):**
+
+- **No prompt-cache impact — confirmed.** `Δcache_creation = +2` (the nonce) on
+  *every* task vs plain `codemcp`. Unlike the re-listing arm, validation leaves
+  the description untouched, so nothing is re-created. This is the design's main
+  promise and it holds exactly.
+- **No measured turn benefit — because the tasks didn't provoke wrong guesses.**
+  **Zero pre-flight field rejections fired across all 90 runs.** On these GitHub
+  tasks the model nearly always names fields correctly first try (`login`,
+  `number`, …), so the validator never had a bad guess to catch. The turn deltas
+  that *do* appear are variance, not validation: deterministic tasks (A/B/E) are
+  identical (`[2,2,2]`/`[3,3,3]`/`[3,3,3]`); on the noisy tasks the spread swings
+  both ways (D `codemcp=[4,9,5]` vs `validate=[2,2,3]` looks like a win, but
+  C `codemcp=[6,5,4]` vs `validate=[7,7,8]` looks like a loss) and tracks
+  tool-call outliers (D/codemcp drew an 8-call flailing run) — with **no
+  rejection events** to attribute any of it to the feature.
+
+**Net:** the validation tier is the *right shape* of solution — zero cache cost,
+client-independent, never in the model's context, and proven to catch real
+mistakes — but this task set doesn't generate enough wrong-field guesses to show
+a turn payoff above the noise floor. The honest follow-up is a task set that
+*forces* obscure nested-field access (deep `commit.author.*`, `*.reactions.*`,
+union-typed fields) where a strong model genuinely guesses wrong, with enough
+repeats to clear variance. The feature stays off by default; its value is a
+correctness/latency safety net for hard shapes, not a measured win on easy ones.
+
 ## Design
 
-Four **arms**, identical except for how the GitHub MCP toolset reaches the model
-and how the client reacts to mid-session tool-list changes:
+Five **arms**, identical except for how the GitHub MCP toolset reaches the model,
+how the client reacts to mid-session tool-list changes, and whether the gateway
+strictly validates field access:
 
 | arm | what the model sees | what runs the tools |
 |---|---|---|
@@ -149,9 +198,13 @@ and how the client reacts to mid-session tool-list changes:
 | `codemcp` | one `execute_python` tool (description = 45 two-line sigs) | agent writes Python; codemcp gateway routes SDK calls to the same GitHub MCP server |
 | `codemcp_shapes` | same as `codemcp`, plus a learned `# returns: {...}` line per tool *after its first call* — **but the snapshot-once client never re-reads it** | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
 | `codemcp_shapes_relist` | **same gateway as `codemcp_shapes`, but a spec-compliant client** that handles `tools/list_changed`, re-lists, and re-binds tools mid-session so the learned `# returns:` line reaches the model on the next turn | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
+| `codemcp_validate` | **same as `codemcp`** (no shape in the description) — but the gateway ships the full learned key structure to the worker, which **rejects wrong field access pre-flight** | gateway with `CODEMCP_LEARN_SHAPES=true` + `CODEMCP_SHAPES_IN_DESCRIPTION=false` |
 
-The last two arms differ **only in client behavior**, isolating "does the client
-act on `list_changed`" from the gateway/transport. The `relisted` field in each
+The `codemcp_shapes` / `codemcp_shapes_relist` pair differs **only in client
+behavior**, isolating "does the client act on `list_changed`" from the
+gateway/transport. The `codemcp_validate` arm isolates the validation tier from
+the description tier (it has the field check but no description shape). The
+`relisted` field in each
 run record counts how many times that client re-listed mid-session (0 for the
 snapshot-once arm by construction).
 

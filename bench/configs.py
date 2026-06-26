@@ -130,7 +130,9 @@ def direct_mcp_config() -> dict[str, Any]:
     }
 
 
-def codemcp_mcp_config(*, learn_shapes: bool = False) -> dict[str, Any]:
+def codemcp_mcp_config(
+    *, learn_shapes: bool = False, shapes_in_description: bool = True
+) -> dict[str, Any]:
     """MultiServerMCPClient config: a fresh `codemcp` stdio gateway.
 
     The gateway is pointed at the bench-local mcp.github.json (only `github`
@@ -154,6 +156,10 @@ def codemcp_mcp_config(*, learn_shapes: bool = False) -> dict[str, Any]:
     }
     if learn_shapes:
         env["CODEMCP_LEARN_SHAPES"] = "true"
+        if not shapes_in_description:
+            # Validation-only mode: keep the strict pre-flight field check but do
+            # NOT append the lossy shape to the description (isolates Tier 1).
+            env["CODEMCP_SHAPES_IN_DESCRIPTION"] = "false"
     # Guard: refuse to start if the token isn't visible to the gateway.
     if not env.get("GITHUB_TOKEN"):
         raise RuntimeError(
@@ -213,7 +219,13 @@ def load_api_key() -> str:
     )
 
 
-ARMS = ("direct", "codemcp", "codemcp_shapes", "codemcp_shapes_relist")
+ARMS = (
+    "direct",
+    "codemcp",
+    "codemcp_shapes",
+    "codemcp_shapes_relist",
+    "codemcp_validate",
+)
 
 # Arms whose CLIENT is spec-compliant about tools/list_changed: it registers a
 # notification handler, and on a list_changed it re-lists tools and re-binds them
@@ -238,4 +250,8 @@ def mcp_config_for(arm: str) -> dict[str, Any]:
         return codemcp_mcp_config()
     if arm in ("codemcp_shapes", "codemcp_shapes_relist"):
         return codemcp_mcp_config(learn_shapes=True)
+    if arm == "codemcp_validate":
+        # Strict pre-flight field validation only (no description shape), so its
+        # effect isolates Tier 1 from the description-tier (codemcp_shapes).
+        return codemcp_mcp_config(learn_shapes=True, shapes_in_description=False)
     raise ValueError(f"unknown arm: {arm!r}")
