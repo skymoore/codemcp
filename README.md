@@ -595,7 +595,7 @@ against the SDK surface are. There is **zero** steady-state cost: the model's
 tool description is unchanged, and validation is invisible unless the code is
 actually broken.
 
-### Return shapes (`CODEMCP_LEARN_SHAPES`, opt-in)
+### Return shapes (`CODEMCP_LEARN_SHAPES`, on by default)
 
 The flip side of pre-flight validation: even with valid calls, the model often
 has to *guess the structure of a return value* (`issue["user"]["login"]`) and
@@ -603,9 +603,11 @@ pays a retry when it guesses wrong. Tool signatures advertise argument types but
 usually return `-> dict[str, Any]`, and declared `outputSchema`s are mostly
 absent (and far too verbose to show every turn).
 
-With `CODEMCP_LEARN_SHAPES=true`, each successful tool call teaches the gateway
-the structure of what it actually returns. That knowledge is used through **two
-independent tiers**, each off by default and together gated by the one flag.
+Shape-learning is **on by default** (`CODEMCP_LEARN_SHAPES=true`): each
+successful tool call teaches the gateway the structure of what it actually
+returns. That knowledge is used through **two independent tiers**, together
+gated by the one flag. Set `CODEMCP_LEARN_SHAPES=false` to turn both off, making
+the `call_tool` path and worker behavior byte-identical to a no-shape build.
 
 **Tier 1 — strict pre-flight field validation (works with every client).**
 This is the high-leverage path. The gateway retains the *full* nested key
@@ -621,13 +623,24 @@ login = result["lgoin"]      # ← rejected, not executed:
 # github_get_me: result has no field `lgoin` (line 2). Did you mean `login`?
 ```
 
+Validation descends through **literal array indexing** too, so the common
+list/search-result pattern is covered to any depth:
+
+```
+repos = github_search_repositories(query="...")
+stars = repos["items"][0]["stargazers"]   # ← rejected, not executed:
+# github_search_repositories: result['items'][0] has no field `stargazers`
+#   (line 2). Did you mean `stargazers_count`?
+```
+
 This turns a wasted round-trip (run → `KeyError` traceback → retry on a more
 expensive turn) into a precise same-turn correction. Because it rides the
 **worker**, not the tool list, it reaches the model on every turn regardless of
 client behavior, has **no prompt-cache impact**, and the full key structure
 **never enters the model's context**. It is conservative by construction: only
 simple `x = tool(...)` bindings are tracked, only literal `x["k"]` / `x.k` access
-is checked, and anything dynamic, reassigned, or not-yet-learned is left alone.
+and literal integer indices (`x[0]`) are checked, and anything dynamic (`x[i]`),
+reassigned, or not-yet-learned is left alone.
 
 **Tier 2 — lossy shape in the description (discovery; client-dependent).**
 The first call also learns a small, size-bounded exemplar appended to that tool's
@@ -664,8 +677,22 @@ can't reimport the bloat it exists to avoid.
 > the reason to enable shape-learning; the description tier is a bonus where the
 > client lifecycle allows it.
 
-Both tiers are **lazy and off by default**: nothing is learned, shipped, or shown
-unless the flag is set, and the steady-state tool list is unchanged.
+Both tiers are **lazy**: nothing is learned, shipped, or shown until a tool is
+actually called, and the steady-state tool list is unchanged between calls. To
+disable entirely, set `CODEMCP_LEARN_SHAPES=false`.
+
+> **Get the most out of it: run codemcp as a standalone HTTP gateway.** Both
+> tiers compound across calls, and Tier 2's only client-independent payoff is
+> *cross-session*. Running one long-lived gateway —
+> `codemcp start` (Streamable HTTP, default `127.0.0.1:3388/mcp`) — and pointing
+> your clients at it means shapes learned in one session (and by one client) are
+> already known to the next. A fresh stdio subprocess per client starts cold
+> every time and learns nothing across sessions. Point an MCP client at the
+> running gateway with a `url` instead of a `command`:
+>
+> ```jsonc
+> { "mcpServers": { "codemcp": { "url": "http://127.0.0.1:3388/mcp" } } }
+> ```
 
 ### Control channel
 
@@ -782,7 +809,8 @@ plus the variables below.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEMCP_LEARN_SHAPES` | `false` | Learn each tool's return shape on its first successful call and append it to that tool's entry in the `execute_python` description (`# returns: {...}`). Lazy and bounded; see [Return shapes](#return-shapes-codemcp_learn_shapes-opt-in). |
+| `CODEMCP_LEARN_SHAPES` | `true` | Learn each tool's return shape from its successful calls and use it for strict pre-flight field validation (Tier 1) and a lossy shape in the tool description (Tier 2). On by default; set `false` for byte-identical no-shape behavior. Lazy and bounded; see [Return shapes](#return-shapes-codemcp_learn_shapes-on-by-default). |
+| `CODEMCP_SHAPES_IN_DESCRIPTION` | `true` | When shape-learning is on, also append the lossy `# returns: {...}` exemplar to the tool description (Tier 2). Set `false` to run *only* the pre-flight validation tier. No effect when `CODEMCP_LEARN_SHAPES=false`. |
 
 ### Docker isolation
 

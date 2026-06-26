@@ -95,8 +95,9 @@ pub struct Settings {
     /// Whether to check for updates on startup (default `"true"`).
     pub check_update: bool,
 
-    /// Learn return shapes and use them two ways. Off by default — the
-    /// `call_tool` path and worker behavior are byte-identical when unset.
+    /// Learn return shapes and use them two ways. **On by default.** Set
+    /// `CODEMCP_LEARN_SHAPES=false` to disable, making the `call_tool` path and
+    /// worker behavior byte-identical to a no-shape build.
     ///
     /// When enabled, each successful tool call teaches the gateway the structure
     /// of that tool's return value, surfaced through **two independent tiers**:
@@ -158,7 +159,7 @@ impl Default for Settings {
             summary_cache: default_summary_cache(),
             log: "info".to_string(),
             check_update: true,
-            learn_shapes: false,
+            learn_shapes: true,
             shapes_in_description: true,
         }
     }
