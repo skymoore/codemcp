@@ -531,33 +531,60 @@ def _keyset_descend(ks, key):
     return (False, list(fields.keys()))
 
 
+# Sentinel marking an integer index step (`[0]`) in an access chain, so descent
+# can step through an Array keyset into its element structure. Distinct from a
+# string field key so the two are never confused.
+_INDEX_STEP = ("__index__",)
+
+
 def _literal_access_chain(node):
     """Peel a chain of literal subscripts/attributes off the OUTERMOST expr.
 
     Given an AST node that is the *target* of access (e.g. the whole
-    `x["user"]["login"]`), return `(root_name, [keys...])` where root_name is the
-    base `ast.Name` id and keys is the ordered list of literal string keys.
-    Returns (None, None) if the chain isn't a pure literal access on a Name.
+    `x["items"][0]["login"]`), return `(root_name, [steps...])` where root_name
+    is the base `ast.Name` id and steps is the ordered list of access steps: each
+    step is either a literal string field key or `_INDEX_STEP` (an integer index
+    into an array). Returns (None, None) if the chain isn't a pure literal access
+    on a Name (e.g. it uses a variable/slice subscript).
     """
-    keys = []
+    steps = []
     cur = node
     while True:
         if isinstance(cur, ast.Subscript):
             sl = cur.slice
             # Py3.9+: slice is the expression directly.
             if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
-                keys.append(sl.value)
+                steps.append(sl.value)  # field key
                 cur = cur.value
                 continue
-            return (None, None)  # non-literal / numeric / slice -> bail
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, int) and not isinstance(
+                sl.value, bool
+            ):
+                steps.append(_INDEX_STEP)  # array index
+                cur = cur.value
+                continue
+            return (None, None)  # non-literal / variable / slice -> bail
         if isinstance(cur, ast.Attribute):
-            keys.append(cur.attr)
+            steps.append(cur.attr)
             cur = cur.value
             continue
         if isinstance(cur, ast.Name):
-            keys.reverse()
-            return (cur.id, keys)
+            steps.reverse()
+            return (cur.id, steps)
         return (None, None)
+
+
+def _render_path(steps):
+    """Render the access path taken so far for an error message.
+
+    `["items", _INDEX_STEP]` -> `['items'][0]`; empty -> `result`.
+    """
+    if not steps:
+        return "result"
+    out = ""
+    for s in steps:
+        out += "[0]" if s is _INDEX_STEP else f"[{s!r}]"
+    return out
 
 
 def _validate_field_access(tree, sdk_fns, keysets, errors):
@@ -604,23 +631,30 @@ def _validate_field_access(tree, sdk_fns, keysets, errors):
             continue
         if id(node) in inner:
             continue  # not the outermost link of its chain
-        root, keys = _literal_access_chain(node)
-        if root is None or root not in tracked or not keys:
+        root, steps = _literal_access_chain(node)
+        if root is None or root not in tracked or not steps:
             continue
 
         fn_name = tracked[root]
         ks = keysets.get(fn_name)
         lineno = getattr(node, "lineno", 0)
-        # Descend key by key; stop at first undecidable or invalid step.
-        for depth, key in enumerate(keys):
-            ok, info = _keyset_descend(ks, key)
+        # Descend step by step; stop at first undecidable or invalid step.
+        for depth, step in enumerate(steps):
+            if step is _INDEX_STEP:
+                # Index into an array: descend into the element keyset. If this
+                # node isn't an array (polymorphic/opaque), stop validating.
+                if _keyset_kind(ks) == "array":
+                    ks = ks.get("items") or {"k": "leaf"}
+                    continue
+                break
+            ok, info = _keyset_descend(ks, step)
             if ok is None:
-                break  # can't validate here (array/leaf/opaque) -> stop
+                break  # can't validate here (leaf/opaque) -> stop
             if ok is False:
                 valid = info
                 where = f"(line {lineno})"
-                near = difflib.get_close_matches(key, valid, n=1, cutoff=_SUGGEST_CUTOFF)
-                path = "".join(f"[{k!r}]" for k in keys[:depth]) or "result"
+                near = difflib.get_close_matches(step, valid, n=1, cutoff=_SUGGEST_CUTOFF)
+                path = _render_path(steps[:depth])
                 hint = (
                     f"Did you mean `{near[0]}`?"
                     if near
@@ -630,7 +664,7 @@ def _validate_field_access(tree, sdk_fns, keysets, errors):
                     _format_call_error(
                         fn_name,
                         f"result{('' if path == 'result' else path)} has no field "
-                        f"`{key}` {where}.",
+                        f"`{step}` {where}.",
                         hint,
                     )
                 )

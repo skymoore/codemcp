@@ -235,13 +235,26 @@ result = github_search_issues(**opts)
     )
     check("poisoned name not validated", err is None, repr(err))
 
-    print("9i. array element field via index is NOT over-validated")
-    # pr['issues'] is an array; indexing it then accessing a field is not a
-    # literal-object access we descend into, so it must not be flagged.
+    print("9i. valid field after array index passes (descends through [0])")
     err = Vf(
         "r = github_search_issues(query='x')\nresult = r['issues'][0]['number']"
     )
-    check("array element access not flagged", err is None, repr(err))
+    check("valid array-element field not flagged", err is None, repr(err))
+
+    print("9i2. typo on a field after array index IS flagged")
+    err = Vf(
+        "r = github_search_issues(query='x')\nresult = r['issues'][0]['numbr']"
+    )
+    check("array-element typo flagged", err is not None, repr(err))
+    check("suggests `number`", err and "number" in err, repr(err))
+    check("path shows index", err and "['issues'][0]" in err, repr(err))
+
+    print("9i3. nested obj-in-array-element typo is flagged")
+    err = Vf(
+        "r = github_search_issues(query='x')\nresult = r['issues'][0]['user']['lgoin']"
+    )
+    check("nested array-element typo flagged", err is not None, repr(err))
+    check("suggests `login`", err and "login" in err, repr(err))
 
     print("9j. typo on the array container key IS flagged")
     err = Vf("r = github_search_issues(query='x')\nresult = r['issuez']")
