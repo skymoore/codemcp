@@ -28,9 +28,9 @@ SUMMARY_MD = RESULTS_DIR / "summary.md"
 SUMMARY_CSV = RESULTS_DIR / "summary.csv"
 
 from tasks import TASKS  # noqa: E402
+from configs import ARMS  # noqa: E402  (single source of truth for the arm set)
 
 TASK_BY_ID = {t["id"]: t for t in TASKS}
-ARMS = ("direct", "codemcp", "codemcp_shapes")
 
 
 def _load_runs() -> list[dict[str, Any]]:
@@ -202,6 +202,7 @@ def analyze() -> dict[str, Any]:
             turns = [r.get("num_turns", 0) for r in grp]
             tcalls = [r.get("tool_calls", 0) for r in grp]
             walls = [r.get("wall_seconds", 0.0) for r in grp]
+            relisted = [r.get("relisted", 0) for r in grp]
             rows.append({
                 "task_id": task["id"], "task_name": task["name"], "arm": arm,
                 "n": n, "auto_correct": auto_correct, "auto_accuracy": auto_correct / n,
@@ -210,7 +211,7 @@ def analyze() -> dict[str, Any]:
                 "cache_read_mean": _mean(cr), "cache_read_sd": _stdev(cr),
                 "cache_creation_mean": _mean(cc), "cache_creation_sd": _stdev(cc),
                 "turns_mean": _mean(turns), "tool_calls_mean": _mean(tcalls),
-                "wall_mean": _mean(walls),
+                "wall_mean": _mean(walls), "relisted_mean": _mean(relisted),
             })
 
     return {"runs": runs, "truth": truth, "rows": rows}
@@ -333,6 +334,24 @@ def _write_md(data: dict[str, Any]) -> None:
         "shape-guessing retries); positive Δinput = the shape lines' token cost. "
         "The experiment succeeds if shapes cut turns by more than they cost.",
     )
+    # CLIENT-LIFECYCLE experiment: same shape-learning gateway, but the client
+    # is spec-compliant about tools/list_changed (re-lists + re-binds tools
+    # mid-session) vs the snapshot-once client (codemcp_shapes). If shapes have
+    # ANY within-session value, it shows up HERE — the compliant client is the
+    # only one that can see a shape learned in its own session.
+    rl_rows = [r for r in rows if r["arm"] == "codemcp_shapes_relist" and r.get("n")]
+    if rl_rows:
+        avg_relist = _mean([r.get("relisted_mean", 0) for r in rl_rows])
+        _delta_table(
+            "codemcp_shapes",
+            "codemcp_shapes_relist",
+            "codemcp_shapes_relist vs codemcp_shapes (CLIENT-LIFECYCLE EXPERIMENT)",
+            "Same shape-learning gateway; the relist client re-lists + re-binds "
+            "tools on notifications/tools/list_changed (mean re-lists/run "
+            f"= {avg_relist:.1f}), so it is the ONLY arm that can act on a shape "
+            "learned mid-session. negative Δturns = the compliant client used a "
+            "learned shape to skip a round-trip the snapshot-once client could not.",
+        )
 
     if err_runs:
         lines.append("## errored runs\n")

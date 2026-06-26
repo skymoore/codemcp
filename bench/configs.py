@@ -213,7 +213,22 @@ def load_api_key() -> str:
     )
 
 
-ARMS = ("direct", "codemcp", "codemcp_shapes")
+ARMS = ("direct", "codemcp", "codemcp_shapes", "codemcp_shapes_relist")
+
+# Arms whose CLIENT is spec-compliant about tools/list_changed: it registers a
+# notification handler, and on a list_changed it re-lists tools and re-binds them
+# to the model so the NEXT request carries the updated descriptions. This is the
+# behavior most MCP clients SHOULD have but langchain-mcp-adapters' default
+# `load_mcp_tools`-once flow does NOT. The `codemcp_shapes` arm (snapshot-once
+# client) and `codemcp_shapes_relist` arm (compliant client) hit the IDENTICAL
+# shape-learning gateway, so the only variable is whether the client picks up a
+# mid-session shape — isolating "client lifecycle" from "MCP/topology".
+RELIST_ARMS = frozenset({"codemcp_shapes_relist"})
+
+
+def arm_relists(arm: str) -> bool:
+    """True if this arm's client re-lists + re-binds tools on list_changed."""
+    return arm in RELIST_ARMS
 
 
 def mcp_config_for(arm: str) -> dict[str, Any]:
@@ -221,6 +236,6 @@ def mcp_config_for(arm: str) -> dict[str, Any]:
         return direct_mcp_config()
     if arm == "codemcp":
         return codemcp_mcp_config()
-    if arm == "codemcp_shapes":
+    if arm in ("codemcp_shapes", "codemcp_shapes_relist"):
         return codemcp_mcp_config(learn_shapes=True)
     raise ValueError(f"unknown arm: {arm!r}")

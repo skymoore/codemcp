@@ -300,8 +300,10 @@ codemcp disable github --make-default  # disconnect now AND set enabled:false in
 
 When an upstream is enabled/disabled, codemcp regenerates the Python SDK,
 hot-reloads it into the running worker (no worker restart, no lost state), and
-sends a `notifications/tools/list_changed` to connected MCP clients so they
-re-read the updated `execute_python` description.
+sends a `notifications/tools/list_changed` to connected MCP clients. Clients that
+honor the notification re-read the updated `execute_python` description on their
+next `tools/list`; snapshot-once clients (which list tools only at startup) keep
+the old description until the next session.
 
 > Note: `--make-default` rewrites `mcp.json` (preserving all values) and may
 > reorder keys alphabetically.
@@ -622,17 +624,26 @@ called, so the steady-state tool list is unchanged and there is no cost unless
 the flag is set.
 
 > **Scope (measured — see [`bench/`](./bench)):** a learned shape only reaches
-> the model on a *subsequent* `tools/list`. Most MCP clients (e.g.
-> `langchain-mcp-adapters`) list tools once per session and ignore
-> `tools/list_changed`, so in the default **stdio-per-session** topology each
-> session learns shapes it never sees and discards them on exit — effectively a
-> no-op. Shapes do reach **later sessions of a shared `codemcp start` HTTP
-> gateway** (verified). The bench also confirmed shapes do **not** bust prompt
-> caching (the cached prefix is frozen at session start), so there's no downside
-> — but in the common single-session case there's currently no upside either.
-> Hence: off by default. The natural fix is to surface shapes through a channel
-> every client always sees (e.g. inline in the tool *result*), not via a
-> description the client won't re-read.
+> the model on a *subsequent* `tools/list`, so whether it helps depends entirely
+> on the **client's** tool-listing lifecycle — not on MCP, the transport, or the
+> gateway:
+> - **Snapshot-once clients** (most, e.g. `langchain-mcp-adapters`) list tools
+>   once and ignore `tools/list_changed`, so the session never sees the shape it
+>   learned — a no-op, but with **no prompt-cache downside** (the cached prefix is
+>   never mutated).
+> - **Spec-compliant clients** that re-list on `tools/list_changed` *do* see the
+>   shape mid-session (bench arm `codemcp_shapes_relist`, verified) — but in the
+>   bench this bought **no reliable turn saving** and **did bust the prompt cache**
+>   (re-listing mutates the cached tool-schema prefix: ~+4.3k `cache_creation`,
+>   ~−4.3k `cache_read` per task).
+> - Shapes do reach **later sessions of a shared `codemcp start` HTTP gateway**
+>   (verified) — a real but cross-session-only benefit.
+>
+> Hence: **off by default.** Either the client can't see the shape (no-op) or it
+> pays a cache cost to see it with no measured payoff. The promising fix is to
+> surface shapes through a channel that needs no re-list and mutates no cached
+> prefix — **inline in the tool *result***, which every client always feeds back
+> to the model — rather than via a description the client must re-read.
 
 ### Control channel
 

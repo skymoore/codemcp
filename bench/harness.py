@@ -30,6 +30,7 @@ from configs import (
     ZEN_BASE_URL,
     ZEN_MODEL,
     active_model,
+    arm_relists,
     load_api_key,
     mcp_config_for,
 )
@@ -143,6 +144,85 @@ def _agent_prompt(nonce: str = ""):
     return SYSTEM_PROMPT
 
 
+def _list_changed_handler(event: asyncio.Event):
+    """Build an MCP `message_handler` that sets `event` on tools/list_changed.
+
+    A spec-compliant MCP client SHOULD react to
+    `notifications/tools/list_changed` by re-listing tools. The default
+    langchain-mcp-adapters flow calls `load_mcp_tools` once and never installs
+    such a handler, so it never learns the tool list changed. We install this
+    handler (via session_kwargs) for the relist arm; the agent loop then re-lists
+    and re-binds whenever the event is set. This is the ONLY behavioral
+    difference between codemcp_shapes (snapshot-once) and codemcp_shapes_relist.
+    """
+    from mcp.types import ServerNotification, ToolListChangedNotification
+
+    async def handler(message: Any) -> None:
+        # message is a RequestResponder | ServerNotification | Exception.
+        note = getattr(message, "root", message)
+        if isinstance(message, ServerNotification) and isinstance(
+            note, ToolListChangedNotification
+        ):
+            event.set()
+
+    return handler
+
+
+async def _run_relisting_agent(
+    session,
+    llm: ChatAnthropic,
+    tools: list,
+    task: dict[str, Any],
+    label: str,
+    list_changed: asyncio.Event,
+) -> tuple[list, int]:
+    """Manual agent loop that re-lists + re-binds tools on tools/list_changed.
+
+    Each turn, if the gateway has signalled list_changed since the last turn, we
+    re-run load_mcp_tools(session) and re-bind, so the NEXT model request carries
+    the updated `execute_python` description (now including any learned shapes).
+    Returns (messages, relist_count). relist_count > 0 proves the client actually
+    picked up a mid-session change.
+    """
+    tools_by_name = {t.name: t for t in tools}
+    model = llm.bind_tools(tools)
+    prompt = _agent_prompt(label)  # SystemMessage (openrouter) or str (zen)
+    system_msg = prompt if isinstance(prompt, SystemMessage) else SystemMessage(content=prompt)
+    messages: list = [system_msg, HumanMessage(content=task["prompt"])]
+    relist_count = 0
+    for _ in range(RECURSION_LIMIT):
+        # Pick up any mid-session tool-list change BEFORE issuing the next turn,
+        # so the new descriptions reach the model on this very request.
+        if list_changed.is_set():
+            list_changed.clear()
+            tools = await load_mcp_tools(session)
+            tools_by_name = {t.name: t for t in tools}
+            model = llm.bind_tools(tools)
+            relist_count += 1
+
+        ai: AIMessage = await model.ainvoke(messages)
+        messages.append(ai)
+        if not ai.tool_calls:
+            break
+        for call in ai.tool_calls:
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                messages.append(
+                    ToolMessage(
+                        content=f"error: unknown tool {call['name']!r}",
+                        tool_call_id=call["id"],
+                    )
+                )
+                continue
+            try:
+                out = await tool.ainvoke(call["args"])
+                content = out if isinstance(out, str) else str(out)
+            except Exception as e:  # noqa: BLE001
+                content = f"error: {type(e).__name__}: {e}"
+            messages.append(ToolMessage(content=content, tool_call_id=call["id"]))
+    return messages, relist_count
+
+
 async def run_one(
     arm: str,
     task: dict[str, Any],
@@ -153,27 +233,50 @@ async def run_one(
     """Run a single task under one arm. Returns a run record dict."""
     cfg = mcp_config_for(arm)
     server_name = next(iter(cfg))
+    relists = arm_relists(arm)
+
+    # For the relist arm, install a tools/list_changed handler on the session so
+    # the client learns when the gateway mutates the tool list mid-session.
+    list_changed = asyncio.Event()
+    if relists:
+        conn = cfg[server_name]
+        sk = dict(conn.get("session_kwargs") or {})
+        sk["message_handler"] = _list_changed_handler(list_changed)
+        conn["session_kwargs"] = sk
+
     client = MultiServerMCPClient(cfg)
+    relist_count = 0
     # Stateful session: keep the MCP connection alive for the whole agent run so
     # the upstream (github container / codemcp gateway) isn't relaunched per
     # tool call — matters for wall-time fairness and avoids docker churn.
     async with client.session(server_name) as session:
         tools = await load_mcp_tools(session)
-        # Use the unique run label as the cache nonce so runs don't share the
-        # provider-side ephemeral prompt cache (see _agent_prompt).
-        agent = _make_agent(model=llm, tools=tools, prompt=_agent_prompt(label))
 
         t0 = time.perf_counter()
         error: str | None = None
         result: dict[str, Any] = {}
         try:
-            result = await asyncio.wait_for(
-                agent.ainvoke(
-                    {"messages": [HumanMessage(content=task["prompt"])]},
-                    config={"recursion_limit": RECURSION_LIMIT},
-                ),
-                timeout=RUN_TIMEOUT_S,
-            )
+            if relists:
+                msgs_out, relist_count = await asyncio.wait_for(
+                    _run_relisting_agent(
+                        session, llm, tools, task, label, list_changed
+                    ),
+                    timeout=RUN_TIMEOUT_S,
+                )
+                result = {"messages": msgs_out}
+            else:
+                # Use the unique run label as the cache nonce so runs don't share
+                # the provider-side ephemeral prompt cache (see _agent_prompt).
+                agent = _make_agent(
+                    model=llm, tools=tools, prompt=_agent_prompt(label)
+                )
+                result = await asyncio.wait_for(
+                    agent.ainvoke(
+                        {"messages": [HumanMessage(content=task["prompt"])]},
+                        config={"recursion_limit": RECURSION_LIMIT},
+                    ),
+                    timeout=RUN_TIMEOUT_S,
+                )
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
         wall = time.perf_counter() - t0
@@ -207,6 +310,7 @@ async def run_one(
         "tool_calls": tool_calls,
         "tool_results": tool_results,
         "num_tools_bound": len(tools),
+        "relisted": relist_count,
         "usage_per_turn": per_turn,
         "totals": _aggregate(per_turn),
         "final_answer": final_answer,

@@ -15,32 +15,70 @@ surfaces each tool's *return shape* (`CODEMCP_LEARN_SHAPES`, the `codemcp_shapes
 arm), does the model stop guessing nested field names — saving round-trips — by
 more than the shape lines cost in tokens?
 
+A third question (the **client-lifecycle experiment**, the `codemcp_shapes_relist`
+arm): the answer to question two turns out to depend entirely on *client*
+behavior, not on MCP or the gateway. So we add an arm whose client is
+spec-compliant about `tools/list_changed` — it re-lists and re-binds tools
+mid-session — and ask whether *that* client can turn a learned shape into a
+within-session saving.
+
 ## Shape-learning experiment — result (corrected)
 
-Three arms (`direct`, `codemcp`, `codemcp_shapes`), six tasks (A–C shallow,
-D–F nested-field), measured first on Zen and then re-measured on a
-**prompt-caching** backend (OpenRouter, same `claude-sonnet-4-6`, caching on).
+Four arms (`direct`, `codemcp`, `codemcp_shapes`, `codemcp_shapes_relist`), six
+tasks (A–C shallow, D–F nested-field), measured first on Zen and then re-measured
+on a **prompt-caching** backend (OpenRouter, same `claude-sonnet-4-6`, caching
+on).
 
-**The headline correction: within a single agent session, shape-learning is
-inert — the model never sees the shapes it learns.** Two facts establish this:
+**The headline (corrected, and then corrected again): whether the model ever
+sees a shape it learns is a property of the CLIENT'S tool-listing lifecycle — not
+of MCP, the stdio transport, or the gateway.** Three layers, kept separate:
 
-1. **MCP clients don't re-list tools mid-session.** `langchain-mcp-adapters`
-   (and most clients) call `tools/list` once at startup and **ignore**
-   `tools/list_changed`. The gateway learns a shape after a tool's first call
-   and fires `list_changed`, but the client never re-reads the description, so
-   the `# returns:` line never reaches the model in the session that learned it.
-   *Verified directly:* a fresh `tools/list` shows the shape, but the bound tool
-   object the agent holds does not.
-2. **The earlier C/F "wins" were variance, not shapes.** With the model unable
-   to see shapes mid-session, shapes cannot have caused the reduction. The runs
-   confirm it: plain `codemcp` drew **one flailing 6-turn outlier** per task
-   (it confused itself, unrelated to shapes); with only 3 repeats that single
-   outlier moved the mean by the ~1.3 turns previously attributed to shapes.
-   `codemcp_shapes` simply didn't draw a bad run.
+- **Protocol:** MCP supports mid-session tool changes — that's what
+  `notifications/tools/list_changed` is *for*.
+- **Model/API:** Anthropic/OpenAI take the full tool schema as a per-request
+  parameter, so the model sees whatever tools the client sends on each turn.
+  Nothing here blocks a mid-session shape.
+- **Client (the actual gate):** does the client re-list tools and re-bind them
+  between turns? This is where it's decided.
 
-**The prompt-cache question (the reason for the OpenRouter re-run): shapes do
-NOT bust the cache.** On the deterministic single-path tasks (A/B/E), the two
-arms read **the same cache** every run (per-task totals, n=3 each):
+Two client behaviors, measured head-to-head on the *identical* shape-learning
+gateway:
+
+1. **Snapshot-once client (`codemcp_shapes`, what `langchain-mcp-adapters` and
+   most clients do).** `tools/list` is called once at startup; `list_changed` is
+   **ignored** (the adapter has zero handling for it). The gateway learns a shape
+   after a tool's first call and fires `list_changed`, but the client never
+   re-reads the description, so the `# returns:` line never reaches the model in
+   the session that learned it. Shape-learning is inert here — *not because of
+   MCP, but because this client doesn't act on the notification.*
+
+2. **Compliant re-listing client (`codemcp_shapes_relist`, added for this).** It
+   installs a `tools/list_changed` handler and, before the next turn, re-runs
+   `load_mcp_tools` and re-binds, so the new description reaches the model on the
+   very next request. **This works — verified:** the client re-listed mid-session
+   on every multi-turn task (B–F: ≥1 re-list/run; the run record's `relisted`
+   field counts them). Task A re-lists 0× because it finishes in one tool call —
+   the shape is learned but there's no *next* turn to carry it.
+
+**But the compliant client buys no reliable turn reduction — and it does pay a
+cache cost.** Even though it sees the shapes:
+
+- Deterministic tasks (A/B/E): `Δturns = 0`, identical turn vectors
+  (`[2,2,2]`, `[3,3,3]`, `[3,3,3]`). These already succeed first-try, so there
+  was never a shape-guessing retry to remove.
+- Noisy tasks (C/D/F): still pure variance — `C` looks better with re-listing
+  (`shapes=[9,11,4]` vs `relist=[4,7,4]`), `D` looks worse
+  (`[4,2,4]` vs `[3,6,5]`), `F` is a wash. Both arms span 4–11 turns; neither is
+  consistently ahead.
+- **Cache penalty (newly measured):** re-listing mutates the cached tool-schema
+  prefix mid-session, so the next turn must *re-create* the cache. The relist arm
+  shows **+4373 `cache_creation` and −4277 `cache_read`** per task vs the
+  snapshot-once arm (B/E). This is the real "list_changed busts the cache"
+  effect — and it appears **only when a client actually acts on `list_changed`**.
+
+**The prompt-cache question for the snapshot-once client: shapes do NOT bust the
+cache.** On the deterministic tasks (A/B/E), `codemcp` and `codemcp_shapes` read
+**the same cache** every run (per-task totals, n=3 each):
 
 | task | `codemcp` cache_read | `codemcp_shapes` cache_read |
 |---|---|---|
@@ -48,15 +86,26 @@ arms read **the same cache** every run (per-task totals, n=3 each):
 | B | 8556, 8556, 8556 | 8560, 8560, 8560 |
 | E | 8556, 8556, 8556 | 8560, 8560, 8560 |
 
-The +2/+4 is the per-run cache nonce, not a shape effect. Because the description
-is frozen at session start, the cached tool-schema prefix is never mutated
-mid-session, so the cache is not invalidated. The earlier worry ("mid-session
-`list_changed` busts prompt caching") **does not occur** with real-world clients.
+The +2/+4 is the per-run cache nonce, not a shape effect. The description is
+frozen at session start, so the cached prefix is never mutated — *for a client
+that doesn't re-list*. (A client that re-lists pays the +4373 cache_creation
+shown above. So the cache cost isn't "free in general" — it's free precisely
+because the dominant client never picks the shape up.)
 
-The noisy tasks (C/D/F) show large per-run turn spread in *both* arms
-(`C codemcp=[8,9,4]`, `F shapes=[5,3,7]`) with neither consistently ahead — and
-the apparent shape "win" lands on **different** tasks than the Zen run (D/F here,
-C/F there), the signature of variance rather than a real effect.
+The noisy tasks (C/D/F) show large per-run turn spread in *every* arm
+(`C codemcp=[8,9,4]`, `F shapes=[5,3,7]`) with none consistently ahead — and the
+apparent shape "win" lands on **different** tasks across runs (D/F on one Zen run,
+C on the caching run), the signature of variance rather than a real effect.
+
+**Net:** there is no measured within-session benefit to shape-learning in this
+bench, under *either* client. The snapshot-once client can't see shapes (so they
+cost nothing); the compliant client sees them but extracts no reliable turn
+saving while paying a prompt-cache re-creation cost. The honest conclusion is
+that surfacing shapes through the tool *description* is the wrong channel — it
+either isn't read (snapshot-once) or busts the cache when it is (re-listing). A
+shape delivered inline in the tool *result* (which every client always feeds back
+to the model, with no re-list and no prefix mutation) is the design that could
+actually pay off; that's the recommended next experiment.
 
 **Where shapes *do* work: the shared, multi-session gateway.** With a long-lived
 `codemcp start` HTTP gateway serving several sessions, a shape learned in
@@ -66,33 +115,47 @@ against the same shared gateway sees `# returns: {...}`. So the value is real bu
 
 ### Verdict
 
-- **Default stdio-per-session topology (opencode, this bench): shape-learning is
-  effectively a no-op** — each session gets a fresh gateway, learns shapes the
-  session never sees, and discards them on exit.
+- **Snapshot-once client (the dominant case — opencode, `langchain-mcp-adapters`,
+  this bench's default): shape-learning is effectively a no-op** — the client
+  never re-lists, so the model never sees the shape the session learned. No turn
+  benefit, but also **no prompt-cache downside** (the cached prefix is never
+  mutated).
+- **Compliant re-listing client (`codemcp_shapes_relist`, measured here): sees
+  the shape mid-session, but extracts no reliable turn saving** (deterministic
+  tasks unchanged; noisy tasks remain variance-dominated) **and pays a
+  prompt-cache re-creation cost** (+~4373 `cache_creation`, −~4277 `cache_read`
+  per task, because re-listing mutates the cached tool-schema prefix).
 - **Shared HTTP gateway with multiple sessions: shapes reach later sessions** and
   can help — but this bench doesn't exercise that topology, so the magnitude is
   unmeasured here.
-- **No prompt-cache downside either way.**
 
-**Recommendation: keep `CODEMCP_LEARN_SHAPES` off by default.** Not because it's
-risky (it isn't), but because in the dominant single-session topology it does
-nothing for the model while still doing per-first-call work. The honest
-follow-ups that would justify turning it on: (a) a multi-session shared-gateway
-bench, and (b) clients that honor `tools/list_changed` (or surfacing shapes
-through a channel that doesn't depend on re-listing — e.g. inline in the tool
-*result*, which every client always sees).
+**Recommendation: keep `CODEMCP_LEARN_SHAPES` off by default.** Under the
+dominant snapshot-once client it does nothing for the model while doing
+per-first-call work; under a compliant client it busts the prompt cache without a
+measurable turn payoff. The honest follow-ups that would justify turning it on:
+(a) a multi-session shared-gateway bench, and (b) — the more promising one —
+surfacing shapes through a channel that needs no re-list and mutates no cached
+prefix: **inline in the tool result**, which every client always feeds back to
+the model. That avoids both failure modes this experiment exposed.
 
 ## Design
 
-Two **arms**, identical except for how the GitHub MCP toolset reaches the model:
+Four **arms**, identical except for how the GitHub MCP toolset reaches the model
+and how the client reacts to mid-session tool-list changes:
 
 | arm | what the model sees | what runs the tools |
 |---|---|---|
 | `direct` | all ~45 GitHub MCP tools, bound directly | LangGraph `ToolNode` calls the GitHub MCP server |
 | `codemcp` | one `execute_python` tool (description = 45 two-line sigs) | agent writes Python; codemcp gateway routes SDK calls to the same GitHub MCP server |
-| `codemcp_shapes` | same as `codemcp`, plus a learned `# returns: {...}` line per tool *after its first call* | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
+| `codemcp_shapes` | same as `codemcp`, plus a learned `# returns: {...}` line per tool *after its first call* — **but the snapshot-once client never re-reads it** | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
+| `codemcp_shapes_relist` | **same gateway as `codemcp_shapes`, but a spec-compliant client** that handles `tools/list_changed`, re-lists, and re-binds tools mid-session so the learned `# returns:` line reaches the model on the next turn | identical gateway with `CODEMCP_LEARN_SHAPES=true` |
 
-Both arms bind the **same** upstream server (`ghcr.io/github/github-mcp-server`,
+The last two arms differ **only in client behavior**, isolating "does the client
+act on `list_changed`" from the gateway/transport. The `relisted` field in each
+run record counts how many times that client re-listed mid-session (0 for the
+snapshot-once arm by construction).
+
+All arms bind the **same** upstream server (`ghcr.io/github/github-mcp-server`,
 github entry sourced from the user's codemcp `mcp.json`) and run the **same**
 model on the **same** endpoint.
 
