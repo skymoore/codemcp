@@ -38,6 +38,25 @@ ZEN_BASE_URL = "https://opencode.ai/zen"
 ZEN_MODEL = os.environ.get("BENCH_MODEL", "claude-sonnet-4-6")
 OPENCODE_AUTH_PATH = Path.home() / ".local/share/opencode/auth.json"
 
+# Provider selection. `zen` (default) uses OpenCode Zen's Anthropic endpoint
+# (where prompt caching was never observed — cache_read was always 0).
+# `openrouter` uses OpenRouter's Anthropic-native endpoint with the SAME model
+# (claude-sonnet-4-6) and prompt caching ENABLED via cache_control on the system
+# block, so we can measure whether a shape-driven tools/list_changed busts the
+# prompt cache. Holding the model fixed isolates caching as the only variable.
+BENCH_PROVIDER = os.environ.get("BENCH_PROVIDER", "zen").lower()
+# Anthropic-native Messages endpoint on OpenRouter. langchain-anthropic's
+# ChatAnthropic targets `{base}/v1/messages`; it returns the flat Anthropic
+# cache_read_input_tokens / cache_creation_input_tokens usage fields.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api"
+# Same family as Zen's claude-sonnet-4-6, addressed by OpenRouter's id.
+OPENROUTER_MODEL = os.environ.get("BENCH_OPENROUTER_MODEL", "anthropic/claude-sonnet-4.6")
+
+
+def active_model() -> str:
+    """The model id for the active provider (for run records / reports)."""
+    return OPENROUTER_MODEL if BENCH_PROVIDER == "openrouter" else ZEN_MODEL
+
 _ENV_VAR_RE = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -173,6 +192,25 @@ def load_zen_api_key() -> str:
             "https://opencode.ai/auth and run opencode /connect for Zen"
         )
     return key
+
+
+def load_openrouter_api_key() -> str:
+    """Read OPENROUTER_API_KEY (loaded from bench/.env into os.environ)."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            f"OPENROUTER_API_KEY missing — populate {BENCH_ENV_FILE} (git-ignored)"
+        )
+    return key
+
+
+def load_api_key() -> str:
+    """API key for the active provider."""
+    return (
+        load_openrouter_api_key()
+        if BENCH_PROVIDER == "openrouter"
+        else load_zen_api_key()
+    )
 
 
 ARMS = ("direct", "codemcp", "codemcp_shapes")

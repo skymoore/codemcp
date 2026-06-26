@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from configs import ARMS, ZEN_MODEL, load_zen_api_key
+from configs import ARMS, active_model, load_api_key
 from harness import build_llm, run_one
 from tasks import TASKS
 
@@ -59,7 +59,7 @@ async def _run_matrix(
     arms: list[str],
     repeats: int,
 ) -> list[dict[str, Any]]:
-    api_key = load_zen_api_key()
+    api_key = load_api_key()
     records: list[dict[str, Any]] = []
     total = len(tasks) * len(arms) * repeats
     done = 0
@@ -79,7 +79,7 @@ async def _run_matrix(
                         "arm": arm,
                         "task_id": task["id"],
                         "task_name": task["name"],
-                        "model": ZEN_MODEL,
+                        "model": active_model(),
                         "label": label,
                         "ok": False,
                         "error": f"{type(e).__name__}: {e}",
@@ -138,7 +138,7 @@ def main() -> None:
     repeats = 1 if args.smoke else args.repeats
 
     print(
-        f"bench: model={ZEN_MODEL} tasks={[t['id'] for t in tasks]} "
+        f"bench: model={active_model()} tasks={[t['id'] for t in tasks]} "
         f"arms={arms} repeats={repeats} -> {len(tasks)*len(arms)*repeats} runs",
         flush=True,
     )

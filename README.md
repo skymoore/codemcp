@@ -619,10 +619,20 @@ bloat it exists to avoid.
 
 It is **lazy and off by default**: a shape appears only *after* a tool has been
 called, so the steady-state tool list is unchanged and there is no cost unless
-the flag is set. In the [`bench/`](./bench) shape-learning experiment, surfacing
-shapes removed a full round-trip on nested-field tasks (−1 to −1.33 turns,
-−12k to −17k input tokens) and on one task fixed a wrong answer, with **exactly
-zero** token delta on tasks that didn't need it.
+the flag is set.
+
+> **Scope (measured — see [`bench/`](./bench)):** a learned shape only reaches
+> the model on a *subsequent* `tools/list`. Most MCP clients (e.g.
+> `langchain-mcp-adapters`) list tools once per session and ignore
+> `tools/list_changed`, so in the default **stdio-per-session** topology each
+> session learns shapes it never sees and discards them on exit — effectively a
+> no-op. Shapes do reach **later sessions of a shared `codemcp start` HTTP
+> gateway** (verified). The bench also confirmed shapes do **not** bust prompt
+> caching (the cached prefix is frozen at session start), so there's no downside
+> — but in the common single-session case there's currently no upside either.
+> Hence: off by default. The natural fix is to surface shapes through a channel
+> every client always sees (e.g. inline in the tool *result*), not via a
+> description the client won't re-read.
 
 ### Control channel
 

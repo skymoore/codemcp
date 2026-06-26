@@ -15,36 +15,72 @@ surfaces each tool's *return shape* (`CODEMCP_LEARN_SHAPES`, the `codemcp_shapes
 arm), does the model stop guessing nested field names — saving round-trips — by
 more than the shape lines cost in tokens?
 
-## Shape-learning experiment — result
+## Shape-learning experiment — result (corrected)
 
-Run with three arms (`direct`, `codemcp`, `codemcp_shapes`) over six tasks
-(A–C shallow, D–F deeper / nested-field), 3 repeats = 54 runs, all answered.
-Headline (`codemcp_shapes` vs `codemcp`):
+Three arms (`direct`, `codemcp`, `codemcp_shapes`), six tasks (A–C shallow,
+D–F nested-field), measured first on Zen and then re-measured on a
+**prompt-caching** backend (OpenRouter, same `claude-sonnet-4-6`, caching on).
 
-| task | Δinput | Δturns | Δtools | effect |
-|---|---|---|---|---|
-| A, B, E | 0 | 0 | 0 | none — model didn't need the shape |
-| D | 0 | 0 | 0 | none — data was inline in the first result |
-| **C** | **−16,713** | **−1.33** | **−1.33** | shape removed a retry round-trip |
-| **F** | **−11,680** | **−1.00** | **−1.00** | shape removed a retry **and** fixed correctness (67% → 100%) |
+**The headline correction: within a single agent session, shape-learning is
+inert — the model never sees the shapes it learns.** Two facts establish this:
 
-Two findings:
+1. **MCP clients don't re-list tools mid-session.** `langchain-mcp-adapters`
+   (and most clients) call `tools/list` once at startup and **ignore**
+   `tools/list_changed`. The gateway learns a shape after a tool's first call
+   and fires `list_changed`, but the client never re-reads the description, so
+   the `# returns:` line never reaches the model in the session that learned it.
+   *Verified directly:* a fresh `tools/list` shows the shape, but the bound tool
+   object the agent holds does not.
+2. **The earlier C/F "wins" were variance, not shapes.** With the model unable
+   to see shapes mid-session, shapes cannot have caused the reduction. The runs
+   confirm it: plain `codemcp` drew **one flailing 6-turn outlier** per task
+   (it confused itself, unrelated to shapes); with only 3 repeats that single
+   outlier moved the mean by the ~1.3 turns previously attributed to shapes.
+   `codemcp_shapes` simply didn't draw a bad run.
 
-1. **Where shape-guessing bites, shapes pay off.** On C and F — where the model
-   had to index into an unseen returned structure — a learned shape removed a
-   whole round-trip (fewer turns/tool calls) and cut input tokens (the saved
-   turn would have re-sent the conversation). On F, plain `codemcp` once flailed
-   for 6 turns and answered *wrong*; all three `codemcp_shapes` runs were a clean
-   3 turns and correct.
-2. **Zero steady-state cost.** On the tasks that didn't need shapes (A/B/D/E),
-   `Δinput` was **exactly 0** — confirming the lazy design: a shape is appended
-   only *after* a tool is first called, so the model's tool description is
-   unchanged until a shape is actually learned, and it only changes behavior
-   where shape-guessing was happening.
+**The prompt-cache question (the reason for the OpenRouter re-run): shapes do
+NOT bust the cache.** On the deterministic single-path tasks (A/B/E), the two
+arms read **the same cache** every run (per-task totals, n=3 each):
 
-Verdict: ship behind the flag (`CODEMCP_LEARN_SHAPES`, off by default). It is a
-strict improvement on nested-field tasks with no measurable downside on the
-others. Re-run below to reproduce; results drift slightly with live GitHub data.
+| task | `codemcp` cache_read | `codemcp_shapes` cache_read |
+|---|---|---|
+| A | 4278, 4278, 4278 | 4280, 4280, 4280 |
+| B | 8556, 8556, 8556 | 8560, 8560, 8560 |
+| E | 8556, 8556, 8556 | 8560, 8560, 8560 |
+
+The +2/+4 is the per-run cache nonce, not a shape effect. Because the description
+is frozen at session start, the cached tool-schema prefix is never mutated
+mid-session, so the cache is not invalidated. The earlier worry ("mid-session
+`list_changed` busts prompt caching") **does not occur** with real-world clients.
+
+The noisy tasks (C/D/F) show large per-run turn spread in *both* arms
+(`C codemcp=[8,9,4]`, `F shapes=[5,3,7]`) with neither consistently ahead — and
+the apparent shape "win" lands on **different** tasks than the Zen run (D/F here,
+C/F there), the signature of variance rather than a real effect.
+
+**Where shapes *do* work: the shared, multi-session gateway.** With a long-lived
+`codemcp start` HTTP gateway serving several sessions, a shape learned in
+session 1 **is** present at session 2's `tools/list`. *Verified:* fresh session 2
+against the same shared gateway sees `# returns: {...}`. So the value is real but
+**cross-session**, not within-session.
+
+### Verdict
+
+- **Default stdio-per-session topology (opencode, this bench): shape-learning is
+  effectively a no-op** — each session gets a fresh gateway, learns shapes the
+  session never sees, and discards them on exit.
+- **Shared HTTP gateway with multiple sessions: shapes reach later sessions** and
+  can help — but this bench doesn't exercise that topology, so the magnitude is
+  unmeasured here.
+- **No prompt-cache downside either way.**
+
+**Recommendation: keep `CODEMCP_LEARN_SHAPES` off by default.** Not because it's
+risky (it isn't), but because in the dominant single-session topology it does
+nothing for the model while still doing per-first-call work. The honest
+follow-ups that would justify turning it on: (a) a multi-session shared-gateway
+bench, and (b) clients that honor `tools/list_changed` (or surfacing shapes
+through a channel that doesn't depend on re-listing — e.g. inline in the tool
+*result*, which every client always sees).
 
 ## Design
 
@@ -62,9 +98,20 @@ model on the **same** endpoint.
 
 ### Model + endpoint
 
-- Inference: **OpenCode Zen** Anthropic-compatible endpoint
-  `https://opencode.ai/zen/v1/messages`, model `claude-sonnet-4-6`, `temperature=0`.
-- API key: read from `~/.local/share/opencode/auth.json` (`opencode` key).
+Two providers, selected with `BENCH_PROVIDER` (default `zen`):
+
+- `zen` — **OpenCode Zen** Anthropic-compatible endpoint
+  `https://opencode.ai/zen/v1/messages`, model `claude-sonnet-4-6`,
+  `temperature=0`. Key from `~/.local/share/opencode/auth.json` (`opencode`).
+  Prompt caching was never observed here (`cache_read` always 0).
+- `openrouter` — **OpenRouter Anthropic-native** endpoint with the **same**
+  `claude-sonnet-4.6`, prompt caching **enabled** via `cache_control: ephemeral`
+  on the tool-schema + system prefix. This is the arm that can detect a
+  shape-driven cache bust. A per-run nonce makes each run's cached prefix unique
+  so the provider's ~5-min ephemeral cache isn't shared across runs (otherwise
+  one run warms the cache for the next and contaminates the measurement). Key
+  from `OPENROUTER_API_KEY` in `bench/.env`. Run with
+  `BENCH_PROVIDER=openrouter`.
 
 ### Tasks (over the GitHub user `skymoore`)
 
