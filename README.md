@@ -304,8 +304,10 @@ codemcp disable github --make-default  # disconnect now AND set enabled:false in
 
 When an upstream is enabled/disabled, codemcp regenerates the Python SDK,
 hot-reloads it into the running worker (no worker restart, no lost state), and
-sends a `notifications/tools/list_changed` to connected MCP clients so they
-re-read the updated `execute_python` description.
+sends a `notifications/tools/list_changed` to connected MCP clients. Clients that
+honor the notification re-read the updated `execute_python` description on their
+next `tools/list`; snapshot-once clients (which list tools only at startup) keep
+the old description until the next session.
 
 > Note: `--make-default` rewrites `mcp.json` (preserving all values) and may
 > reorder keys alphabetically.
@@ -588,9 +590,10 @@ check can never drift from what the model sees). It catches:
 - **Unknown keyword arguments** — `github_search_issues(stat="open")` →
   *"unknown argument `stat`. Did you mean `state`?"* (or lists the valid args).
 - **Missing required arguments** — names exactly which ones are absent.
-- **Unauthorized mutations** — a call to a write tool that is not listed in
-  `allow_mutations` → *"is a mutating (write) tool and was not authorized.
-  Re-send with this call listed in `allow_mutations`, or use `dry_run: true`."*
+- **Unauthorized mutations** (only when `CODEMCP_ENFORCE_MUTATIONS=true`) — a
+  call to a write tool that is not listed in `allow_mutations` → *"is a mutating
+  (write) tool and was not authorized. Re-send with this call listed in
+  `allow_mutations`, or use `dry_run: true`."*
 
 If anything fails, the call returns the collected hints in the `error` field
 **without running any code**. The check is deliberately conservative: locally
@@ -599,6 +602,105 @@ comprehensions, and imports are never flagged — only high-confidence mistakes
 against the SDK surface are. There is **zero** steady-state cost: the model's
 tool description is unchanged, and validation is invisible unless the code is
 actually broken.
+
+### Return shapes (`CODEMCP_LEARN_SHAPES`, on by default)
+
+The flip side of pre-flight validation: even with valid calls, the model often
+has to *guess the structure of a return value* (`issue["user"]["login"]`) and
+pays a retry when it guesses wrong. Tool signatures advertise argument types but
+usually return `-> dict[str, Any]`, and declared `outputSchema`s are mostly
+absent (and far too verbose to show every turn).
+
+Shape-learning is **on by default** (`CODEMCP_LEARN_SHAPES=true`): each
+successful tool call teaches the gateway the structure of what it actually
+returns. That knowledge is used through **two independent tiers**, together
+gated by the one flag. Set `CODEMCP_LEARN_SHAPES=false` to turn both off, making
+the `call_tool` path and worker behavior byte-identical to a no-shape build.
+
+**Tier 1 — strict pre-flight field validation (works with every client).**
+This is the high-leverage path. The gateway retains the *full* nested key
+structure of each tool's return value — uncapped, unioned across observed entity
+variants (e.g. GitHub User vs Organization), and seeded from any declared
+`outputSchema` so even the first call is covered — and ships it to the worker.
+The pre-flight validator then rejects a wrong literal field access *before
+executing*, the same way it already rejects a bad argument:
+
+```
+result = github_get_me()
+login = result["lgoin"]      # ← rejected, not executed:
+# github_get_me: result has no field `lgoin` (line 2). Did you mean `login`?
+```
+
+Validation descends through **literal array indexing** too, so the common
+list/search-result pattern is covered to any depth:
+
+```
+repos = github_search_repositories(query="...")
+stars = repos["items"][0]["stargazers"]   # ← rejected, not executed:
+# github_search_repositories: result['items'][0] has no field `stargazers`
+#   (line 2). Did you mean `stargazers_count`?
+```
+
+This turns a wasted round-trip (run → `KeyError` traceback → retry on a more
+expensive turn) into a precise same-turn correction. Because it rides the
+**worker**, not the tool list, it reaches the model on every turn regardless of
+client behavior, has **no prompt-cache impact**, and the full key structure
+**never enters the model's context**. It is conservative by construction: only
+simple `x = tool(...)` bindings are tracked, only literal `x["k"]` / `x.k` access
+and literal integer indices (`x[0]`) are checked, and anything dynamic (`x[i]`),
+reassigned, or not-yet-learned is left alone.
+
+**Tier 2 — lossy shape in the description (discovery; client-dependent).**
+The first call also learns a small, size-bounded exemplar appended to that tool's
+entry in the `execute_python` description, so the model can *discover* field
+names up front:
+
+```
+def github_get_me() -> dict[str, Any]:
+    # Get details of the authenticated user.
+    # returns: {avatar_url: str, details: {bio: str, followers: int, ...}, id: int, login: str}
+```
+
+This exemplar is **bounded by construction** (depth-capped, fields-capped, arrays
+collapsed to one element, hard length cap) — a projection, not a schema, so it
+can't reimport the bloat it exists to avoid.
+
+> **Scope of Tier 2 (measured — see [`bench/`](./bench)):** a learned *description*
+> shape only reaches the model on a *subsequent* `tools/list`, so its usefulness
+> depends on the **client's** tool-listing lifecycle — not on MCP, the transport,
+> or the gateway:
+> - **Snapshot-once clients** (most, e.g. `langchain-mcp-adapters`) list tools
+>   once and ignore `tools/list_changed`, so the session never sees the shape it
+>   learned — a no-op, but with **no prompt-cache downside** (the cached prefix is
+>   never mutated).
+> - **Spec-compliant clients** that re-list *do* see it mid-session (bench arm
+>   `codemcp_shapes_relist`, verified) — but that bought **no reliable turn
+>   saving** and **did bust the prompt cache** (~+4.3k `cache_creation`, ~−4.3k
+>   `cache_read` per task as the tool-schema prefix is re-created).
+> - It does reach **later sessions of a shared `codemcp start` HTTP gateway** —
+>   a real but cross-session-only benefit.
+>
+> Tier 1 (validation) has **none** of these caveats: it works with every client
+> on every turn and never touches the cache. That's why the validation tier is
+> the reason to enable shape-learning; the description tier is a bonus where the
+> client lifecycle allows it.
+
+Both tiers are **lazy**: nothing is learned, shipped, or shown until a tool is
+actually called, and the steady-state tool list is unchanged between calls. To
+disable entirely, set `CODEMCP_LEARN_SHAPES=false`.
+
+> **Get the most out of it: run codemcp as a standalone HTTP gateway.** Both
+> tiers compound across calls, and Tier 2's only client-independent payoff is
+> *cross-session*. Running one long-lived gateway —
+> `codemcp start` (Streamable HTTP, default `127.0.0.1:3388/mcp`) — and pointing
+> your clients at it means shapes learned in one session (and by one client) are
+> already known to the next. A fresh stdio subprocess per client starts cold
+> every time and learns nothing across sessions. Point an MCP client at the
+> running gateway with a `url` instead of a `command`:
+>
+> ```jsonc
+> { "mcpServers": { "codemcp": { "url": "http://127.0.0.1:3388/mcp" } } }
+> ```
 
 ### Control channel
 
@@ -684,6 +786,12 @@ result = gather(
 # -> [{"ok": True, "value": ...}, {"ok": False, "error": {"kind": ..., "server": ...}}, ...]
 ```
 
+> **`ok` means "the tool responded," not "the operation succeeded."** A `False`
+> entry is a raised `ToolError` (timeout, auth, transport, protocol). Many MCP
+> servers report *business-level* failures (a 404, a validation error) as a
+> **normal, successful** string result — those come back as `ok: True` with the
+> error text as `value`. Inspect `value` when a downstream API error is possible.
+
 Nested `Pending` values inside the returned `result` (in dicts, lists, tuples)
 are **deep-resolved automatically** before the result is serialized, so you never
 need `json.dumps(..., default=str)` tricks to force resolution. `resolve(x)` is
@@ -694,41 +802,54 @@ also available to eagerly resolve a nested structure mid-run.
 codemcp classifies every tool as read or **mutation** (write). Classification is,
 in priority order: the MCP `readOnlyHint`/`destructiveHint` annotation, then an
 operator override in `mcp.json` (`tools.<tool>.mutation: true|false`), then a
-name-verb heuristic (`create_*`, `*_delete`, `*_merge`, `run_*`, … are writes;
-`get_*`, `list_*`, `search_*`, … are reads).
+name-verb heuristic (`create_*`, `*_delete`, `*_merge`, `run_*`, `*_write`, … are
+writes; `get_*`, `list_*`, `search_*`, … are reads).
 
-A mutating call is **rejected before execution** unless the run explicitly
-authorizes it. This makes code-mode *safer* than per-tool calls: a write can
-never happen without the model naming it.
+**Enforcement is opt-in and off by default.** Out of the box the agent may call
+any tool, including writes, with no ceremony — code-mode behaves like a normal
+tool caller. Set **`CODEMCP_ENFORCE_MUTATIONS=true`** (operator env var) to turn
+on the pre-flight write gate. When enforcement is on, a mutating call is
+**rejected before execution** unless the run explicitly authorizes it, so a write
+can't happen without the model naming it.
 
 ```jsonc
-// Reads: nothing extra needed.
-{ "code": "result = github_get_me()" }
+// Default (enforcement off): reads and writes both just run.
+{ "code": "result = github_create_pull_request(owner='o', repo='r', title='t', head='f', base='main')" }
 
-// Writes: enumerate them in allow_mutations, or the run is rejected pre-flight.
+// With CODEMCP_ENFORCE_MUTATIONS=true: enumerate writes in allow_mutations,
+// or the run is rejected pre-flight.
 {
   "code": "result = github_create_pull_request(owner='o', repo='r', title='t', head='f', base='main')",
   "allow_mutations": ["github_create_pull_request"]
 }
 
-// Preview a chain of dependent writes without touching anything.
+// Preview a chain of dependent writes without touching anything (any setting).
 { "code": "...", "dry_run": true }
 ```
 
 Under `dry_run`, mutating calls are **not** sent upstream — they return a
 deterministic stub (with common keys like `id`/`number`/`url` populated) so
 dependent logic still runs — while read calls execute normally. The response
-reports the `mutations` that *would* have occurred.
+reports the `mutations` that *would* have occurred. `dry_run` works regardless of
+the enforcement setting.
 
-Every run returns two audit fields:
+Responses stay minimal — only fields that carry signal are emitted:
 
-- `trace` — one compact entry per tool call: `{server, tool, ok, elapsed_ms,
-  mutation, kind?}`. The per-tool-call observability you otherwise lose when
-  calls are batched.
-- `mutations` — the write calls actually performed (or previewed under dry-run).
+- `result` — always present on success.
+- `mutations` — present only when a write (or dry-run write) actually happened:
+  the audit trail of write calls, one entry per `{server, tool, ok}`.
+- `trace` — present only on **failure**, where it localizes the offending call
+  (`{server, tool, ok, elapsed_ms, mutation, kind?}`). On success it's omitted
+  because `result` already conveys the outcome.
+- `stdout`/`stderr` — omitted when empty.
 
-Sensitive argument values (tokens, passwords, keys, …) are redacted from
-`trace`/`mutations`/error output.
+Sensitive argument values (tokens, passwords, keys, …) are redacted from the
+`mutations`/`trace`/error output.
+
+To reclassify individual tools regardless of enforcement, use the per-tool
+`mutation` override in `mcp.json` (see the config reference above):
+`"tools": { "issue_write": { "mutation": false } }` exempts a tool;
+`{ "mutation": true }` forces it to be treated as a write.
 
 ### Self-provisioning worker
 
@@ -786,8 +907,16 @@ plus the variables below.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEMCP_EXEC_TIMEOUT_MS` | `30000` | Per-`run` execution timeout in milliseconds. |
-| `CODEMCP_MAX_OUTPUT_BYTES` | `1048576` | Max captured stdout/stderr bytes. |
+| `CODEMCP_EXEC_TIMEOUT_MS` | `30000` | Per-`run` execution timeout in milliseconds. A timed-out run returns an error to the model immediately; note that a purely CPU-bound Python loop cannot be force-killed, so the worker thread may keep running in the background until it yields (the worker itself stays responsive to new runs). |
+| `CODEMCP_MAX_OUTPUT_BYTES` | `1048576` | Byte cap applied to each model-facing field (`result`, `stdout`, `stderr`) before it is sent back. Oversized `stdout`/`stderr` are truncated with a marker; an oversized `result` is replaced by a compact envelope (`{"_truncated": true, "bytes", "limit", "preview", "hint"}`) so a runaway return or `print` can't blow the token budget. |
+
+### Return shapes
+
+| Variable | Default | Description |
+|---|---|---|
+| `CODEMCP_LEARN_SHAPES` | `true` | Learn each tool's return shape from its successful calls and use it for strict pre-flight field validation (Tier 1) and a lossy shape in the tool description (Tier 2). On by default; set `false` for byte-identical no-shape behavior. Lazy and bounded; see [Return shapes](#return-shapes-codemcp_learn_shapes-on-by-default). |
+| `CODEMCP_SHAPES_IN_DESCRIPTION` | `true` | When shape-learning is on, also append the lossy `# returns: {...}` exemplar to the tool description (Tier 2). Set `false` to run *only* the pre-flight validation tier. No effect when `CODEMCP_LEARN_SHAPES=false`. |
+| `CODEMCP_ENFORCE_MUTATIONS` | `false` | Enforce the write-mutation gate. Off by default: the agent may call any tool (including writes) without `allow_mutations`. Set `true` to reject mutating calls pre-flight unless authorized via `allow_mutations` (or previewed with `dry_run`). See [Write safety](#write-safety-mutation-gating-dry-run-and-audit-trail). |
 
 ### Docker isolation
 

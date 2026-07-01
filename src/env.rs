@@ -94,6 +94,46 @@ pub struct Settings {
 
     /// Whether to check for updates on startup (default `"true"`).
     pub check_update: bool,
+
+    /// Learn return shapes and use them two ways. **On by default.** Set
+    /// `CODEMCP_LEARN_SHAPES=false` to disable, making the `call_tool` path and
+    /// worker behavior byte-identical to a no-shape build.
+    ///
+    /// When enabled, each successful tool call teaches the gateway the structure
+    /// of that tool's return value, surfaced through **two independent tiers**:
+    ///
+    /// 1. **Description tier (lossy).** The first call learns a small,
+    ///    size-bounded exemplar (`# returns: {...}`) appended to that tool's
+    ///    entry in the `execute_python` description, so the model can *discover*
+    ///    field names. Caveat: this only reaches the model on a subsequent
+    ///    `tools/list`. Snapshot-once clients (most, e.g. langchain-mcp-adapters)
+    ///    never re-read it within a session — they see it only in a later session
+    ///    of a shared HTTP gateway. Clients that honor `tools/list_changed` do
+    ///    re-read it, but pay a prompt-cache re-creation cost (the cached
+    ///    tool-schema prefix changes). See `bench/` for the measurements.
+    /// 2. **Validation tier (full).** The *complete* nested key structure
+    ///    (uncapped, unioned across observed entity variants, and seeded from any
+    ///    declared `outputSchema`) is shipped to the worker and used for STRICT
+    ///    pre-flight validation of literal field access: `result["lgoin"]` is
+    ///    rejected before execution with a `did you mean` hint. This tier reaches
+    ///    every client on every turn (it rides the worker, not the tool list),
+    ///    has no prompt-cache impact, and never appears in the model's context.
+    pub learn_shapes: bool,
+
+    /// Whether the lossy shape is appended to the `execute_python` description
+    /// (Tier 1 above). Default `true`. Set false to run *only* the validation
+    /// tier — useful to isolate the two tiers' effects (the bench's
+    /// `codemcp_validate` arm does this). No effect unless `learn_shapes` is on.
+    pub shapes_in_description: bool,
+
+    /// Whether to enforce the write-mutation gate. **Off by default** — the agent
+    /// may call any tool (including writes) without listing it in
+    /// `allow_mutations`. Set `CODEMCP_ENFORCE_MUTATIONS=true` to turn on the
+    /// pre-flight gate: a call classified as a mutation is then rejected unless
+    /// the run authorizes it via `allow_mutations` (or previews it with
+    /// `dry_run`). Classification and the `mutations` audit are unaffected by
+    /// this flag — only enforcement is gated.
+    pub enforce_mutations: bool,
 }
 
 impl Default for Settings {
@@ -128,6 +168,9 @@ impl Default for Settings {
             summary_cache: default_summary_cache(),
             log: "info".to_string(),
             check_update: true,
+            learn_shapes: true,
+            shapes_in_description: true,
+            enforce_mutations: false,
         }
     }
 }
@@ -220,5 +263,30 @@ impl Settings {
         self.control_token
             .as_deref()
             .expect("control_token set in from_env")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_enforcement_is_off_by_default() {
+        // Writes must be allowed by default; enforcement is strictly opt-in.
+        assert!(!Settings::default().enforce_mutations);
+    }
+
+    #[test]
+    fn output_cap_defaults_to_one_mib() {
+        // Must match the worker's `_DEFAULT_MAX_OUTPUT_BYTES` so behavior is
+        // identical whether or not the value is threaded to the worker.
+        assert_eq!(Settings::default().max_output_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn run_options_default_cap_is_zero_sentinel() {
+        // `0` means "gateway didn't inject a cap"; the worker then substitutes
+        // its own default. The runtime overwrites this with the real setting.
+        assert_eq!(crate::control::RunOptions::default().max_output_bytes, 0);
     }
 }

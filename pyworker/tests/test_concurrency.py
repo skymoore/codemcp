@@ -117,7 +117,11 @@ def make_sdk_module(dispatcher):
     mod.t3 = _make("t3")
     mod.boom = _make("boom")
     mod.write = _make("write")
-    mod._codemcp_mutations = {"srv_write"}
+    # The dispatcher keys mutations by the server-prefixed name (`srv_write`); the
+    # pre-flight validator keys them by the Python fn name the user calls
+    # (`write`). Register both so dry-run classification and the enforcement gate
+    # are exercised consistently by the same mock.
+    mod._codemcp_mutations = {"srv_write", "write"}
     mod._codemcp_dispatch = dispatcher.call_tool
     return mod
 
@@ -316,6 +320,21 @@ result = gather(t1(x=1), boom(), t2(y=2))
     check("no error", error is None, error or "")
     check("dispatched real call", result == "write", repr(result))
     check("mutation audited as performed", len(muts) == 1 and muts[0]["ok"] is True, repr(muts))
+
+    print("11a. mutation allowed by default (enforcement off) — no allow_mutations")
+    result, out, err, error, trace, muts = exec_full(
+        "result = write(title='x')['tool']", sdk_module, dispatcher, {}
+    )
+    check("no error", error is None, error or "")
+    check("dispatched without authorization", result == "write", repr(result))
+
+    print("11b. mutation REJECTED when enforcement on and unauthorized")
+    result, out, err, error, trace, muts = exec_full(
+        "result = write(title='x')", sdk_module, dispatcher,
+        {"enforce_mutations": True},  # no allow_mutations
+    )
+    check("rejected pre-flight", error is not None and "mutating" in error, repr(error))
+    check("not dispatched", result is None, repr(result))
 
     print("12. recursive resolve of nested Pending in result container")
     code = """

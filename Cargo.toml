@@ -1,6 +1,6 @@
 [package]
 name = "codemcp"
-version = "0.7.0"
+version = "0.9.0"
 edition = "2021"
 description = "Meta-MCP code-mode gateway: connect many MCP servers, expose one execute_python tool."
 license = "MIT"

@@ -24,6 +24,9 @@ pub struct PyBinding {
     /// Whether this tool mutates state (write). Requires explicit authorization
     /// (`allow_mutations`) before the worker will execute it.
     pub is_mutation: bool,
+    /// Key structure derived from the tool's declared `outputSchema`, if any.
+    /// Used to seed return-field validation before any value is observed.
+    pub output_keyset: Option<crate::sdk::keyset::KeySet>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +317,11 @@ const STRONG_MUTATION_VERBS: &[&str] = &[
     "assign",
     "approve",
     "reject",
+    // Consolidated MCP write tools use a trailing `write` verb with a `method`
+    // arg selecting create/update (e.g. GitHub's `issue_write`,
+    // `pull_request_review_write`, `sub_issue_write`). A leading read verb still
+    // wins above, so `get_write_status`-style reads are unaffected.
+    "write",
 ];
 
 /// Build a [`PyBinding`] for one tool.
@@ -373,6 +381,10 @@ pub fn build_binding(
     let ret = return_type(output_schema);
     let signature = format!("def {fn_name}({}) -> {ret}:", sig_params.join(", "));
 
+    // Seed a validation key structure from the declared outputSchema (if any), so
+    // the first call to a tool can be field-checked before a value is observed.
+    let output_keyset = output_schema.map(crate::sdk::keyset::KeySet::from_output_schema);
+
     PyBinding {
         fn_name,
         server: server.to_string(),
@@ -381,6 +393,7 @@ pub fn build_binding(
         signature,
         params,
         is_mutation,
+        output_keyset,
     }
 }
 
@@ -455,11 +468,17 @@ mod tests {
         assert!(classify_mutation("pods_delete", None, None));
         assert!(classify_mutation("pull_request_merge", None, None));
         assert!(classify_mutation("workflow_run", None, None));
+        // Consolidated write tools: trailing `write` verb (GitHub's *_write).
+        assert!(classify_mutation("issue_write", None, None));
+        assert!(classify_mutation("pull_request_review_write", None, None));
+        assert!(classify_mutation("sub_issue_write", None, None));
         // Leading read verb wins even if a later word looks mutating.
         assert!(!classify_mutation("get_check_runs", None, None));
         assert!(!classify_mutation("list_deployments", None, None));
         // A read that happens to contain a non-strong word stays read.
         assert!(!classify_mutation("pull_request_read", None, None));
+        // A leading read verb still wins over a trailing `write`.
+        assert!(!classify_mutation("get_write_status", None, None));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 
-use crate::control::{ControlHandle, ControlServer, RunOptions, RunOutput};
+use crate::control::{ControlHandle, ControlServer, RunOptions, RunOutput, ShapeSink};
 use crate::env::Settings;
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
@@ -31,6 +31,7 @@ impl HostExecutor {
         settings: &Settings,
         sdk_py: &str,
         upstreams: SharedUpstreams,
+        shapes: ShapeSink,
     ) -> Result<Self, Error> {
         // Working directory holding bootstrap.py + sdk.py.
         let workdir = std::env::temp_dir().join(format!("codemcp-{}", std::process::id()));
@@ -40,7 +41,8 @@ impl HostExecutor {
 
         // Bind control server first to learn the actual port.
         let token = settings.control_token().to_string();
-        let server = ControlServer::bind(&settings.control_bind, token.clone(), upstreams).await?;
+        let server =
+            ControlServer::bind(&settings.control_bind, token.clone(), upstreams, shapes).await?;
         let addr = server.local_addr()?;
         let host = settings
             .control_host_for_worker
@@ -110,6 +112,15 @@ impl super::Executor for HostExecutor {
 
     async fn reload_sdk(&self, sdk_py: &str) -> Result<(), Error> {
         self.handle.reload(sdk_py).await
+    }
+
+    async fn set_shapes(
+        &self,
+        keysets: &std::collections::BTreeMap<String, crate::sdk::keyset::KeySet>,
+    ) -> Result<(), Error> {
+        let json = serde_json::to_value(keysets)
+            .map_err(|e| Error::Worker(format!("serialize keysets: {e}")))?;
+        self.handle.set_shapes(json).await
     }
 
     async fn shutdown(&self) {

@@ -3,10 +3,22 @@
 //! Intro + exactly two lines per tool: the typed signature and a one-line
 //! summary. This is the only token cost the agent sees.
 
+use std::collections::BTreeMap;
+
 use crate::env::Isolation;
 use crate::sdk::SdkRegistry;
 
-pub fn build_description(registry: &SdkRegistry, isolation: Isolation) -> String {
+/// Build the `execute_python` description.
+///
+/// `shapes` maps `(server, tool)` to a learned return-shape exemplar. When a
+/// binding has a non-empty learned shape, it is appended as a third line under
+/// that tool (`# returns: {...}`), so the model stops guessing field names.
+/// Pass an empty map to get the classic two-lines-per-tool description.
+pub fn build_description(
+    registry: &SdkRegistry,
+    isolation: Isolation,
+    shapes: &BTreeMap<(String, String), String>,
+) -> String {
     let mut s = String::new();
 
     s.push_str(
@@ -40,10 +52,13 @@ pub fn build_description(registry: &SdkRegistry, isolation: Isolation) -> String
          Add a per-call deadline with the `timeout_ms` kwarg on any call.\n\n",
     );
     s.push_str(
-        "Writes are gated. Tools that mutate state must be authorized: pass \
-         `allow_mutations=[\"<fn_name>\", ...]` alongside your code, or set \
-         `dry_run=true` to preview exactly what would change without writing. Every run \
-         returns a compact `trace` of the calls it made and a `mutations` audit.\n\n",
+        "Writes: set `dry_run=true` to preview exactly what a chain of mutating calls \
+         would change without writing (mutating calls return deterministic stubs; reads \
+         still execute). A run that performs writes returns a `mutations` audit; a run \
+         that fails returns a compact `trace` pinpointing the offending call. Responses \
+         stay minimal otherwise. If the operator has enabled write protection, a mutating \
+         call must be authorized by passing `allow_mutations=[\"<fn_name>\", ...]` \
+         alongside your code.\n\n",
     );
 
     match isolation {
@@ -69,6 +84,14 @@ pub fn build_description(registry: &SdkRegistry, isolation: Isolation) -> String
         s.push_str("    # ");
         s.push_str(&b.summary);
         s.push('\n');
+        // Append a learned return shape, if one has been observed for this tool.
+        if let Some(shape) = shapes.get(&(b.server.clone(), b.tool_name.clone())) {
+            if !shape.is_empty() {
+                s.push_str("    # returns: ");
+                s.push_str(shape);
+                s.push('\n');
+            }
+        }
     }
 
     if registry.bindings.is_empty() {

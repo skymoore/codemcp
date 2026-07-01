@@ -85,6 +85,18 @@ fn normalize_list(v: Value) -> Value {
     }
 }
 
+/// Number of entries in a normalized-list value (0 for non-arrays).
+fn trace_len(v: &Value) -> usize {
+    v.as_array().map(Vec::len).unwrap_or(0)
+}
+
+/// Insert `key` only when `s` is non-empty, keeping the response minimal.
+fn insert_if_nonempty_str(obj: &mut Map<String, Value>, key: &str, s: String) {
+    if !s.is_empty() {
+        obj.insert(key.into(), Value::String(s));
+    }
+}
+
 impl ServerHandler for CodeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -145,32 +157,45 @@ impl ServerHandler for CodeServer {
         let opts = crate::control::RunOptions {
             allow_mutations,
             dry_run,
+            // Injected by the runtime from CODEMCP_ENFORCE_MUTATIONS; the request
+            // can't set it. Default here is overwritten in `executor_run`.
+            enforce_mutations: false,
+            // Likewise injected from CODEMCP_MAX_OUTPUT_BYTES in `executor_run`.
+            max_output_bytes: 0,
         };
 
         let out = self.runtime.executor_run(code, opts).await?;
 
-        // Compact, always-present fields the harness can render/audit.
-        let trace = normalize_list(out.trace);
         let mutations = normalize_list(out.mutations);
 
+        // Token discipline: the response is the model's hot path, so only emit
+        // fields that carry signal. Empty stdout/stderr are dropped. `trace` is
+        // included only on failure, where it localizes the offending call; on
+        // success the `result` already conveys everything the trace would.
+        let mut obj = Map::new();
+
         // User code raised: surface as a tool error (structured), not a protocol
-        // error — the agent can read the traceback and retry. Include the trace
-        // so partial failures are localized to the exact call.
+        // error — the agent can read the traceback and retry.
         if let Some(err) = out.error {
-            return Ok(CallToolResult::structured_error(json!({
-                "error": err,
-                "stdout": out.stdout,
-                "stderr": out.stderr,
-                "trace": trace,
-            })));
+            obj.insert("error".into(), Value::String(err));
+            insert_if_nonempty_str(&mut obj, "stdout", out.stdout);
+            insert_if_nonempty_str(&mut obj, "stderr", out.stderr);
+            let trace = normalize_list(out.trace);
+            if trace_len(&trace) > 0 {
+                obj.insert("trace".into(), trace);
+            }
+            return Ok(CallToolResult::structured_error(Value::Object(obj)));
         }
 
-        Ok(CallToolResult::structured(json!({
-            "result": out.result,
-            "stdout": out.stdout,
-            "stderr": out.stderr,
-            "trace": trace,
-            "mutations": mutations,
-        })))
+        obj.insert("result".into(), out.result);
+        insert_if_nonempty_str(&mut obj, "stdout", out.stdout);
+        insert_if_nonempty_str(&mut obj, "stderr", out.stderr);
+        // Mutations are the audit trail for writes; only present when a write
+        // (or dry-run write) actually happened.
+        if trace_len(&mutations) > 0 {
+            obj.insert("mutations".into(), mutations);
+        }
+
+        Ok(CallToolResult::structured(Value::Object(obj)))
     }
 }

@@ -95,6 +95,26 @@ struct Inner {
     /// Pending OAuth login flows, keyed by server name. Populated by
     /// `auth_start`, consumed by `auth_finish`.
     pending_oauth: Mutex<HashMap<String, LoginHandle>>,
+    /// Learned return shapes, keyed by (server, tool). Populated lazily by the
+    /// shape-learning consumer task on the first successful call to each tool;
+    /// surfaced in the `execute_python` description. Empty when learning is off.
+    shapes: Mutex<BTreeMap<(String, String), String>>,
+    /// Full (uncapped) return key structures, keyed by (server, tool). The
+    /// validation-tier counterpart to `shapes`: accumulated by union across every
+    /// observed call (so entity variants don't drop keys) and shipped to the
+    /// worker for strict pre-flight field validation. Never shown to the model.
+    /// Empty when learning is off.
+    keysets: Mutex<BTreeMap<(String, String), crate::sdk::keyset::KeySet>>,
+    /// Whether learned lossy shapes are appended to the `execute_python`
+    /// description (Tier 2). When false, only the validation tier runs.
+    shapes_in_description: bool,
+    /// Whether the worker enforces the mutation gate (`CODEMCP_ENFORCE_MUTATIONS`).
+    /// Off by default: writes are allowed without `allow_mutations`.
+    enforce_mutations: bool,
+    /// Byte cap the worker applies to `result`/`stdout`/`stderr` before sending
+    /// them back to the model (`CODEMCP_MAX_OUTPUT_BYTES`). Prevents an oversized
+    /// return or `print` from blowing the token budget.
+    max_output_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -104,6 +124,7 @@ struct ConfigEntry {
 }
 
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         upstreams: SharedUpstreams,
         executor: Arc<dyn Executor>,
@@ -111,6 +132,10 @@ impl Runtime {
         config_path: PathBuf,
         launcher: Launcher,
         sdk: SdkState,
+        shape_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::control::ShapeEvent>>,
+        shapes_in_description: bool,
+        enforce_mutations: bool,
+        max_output_bytes: usize,
     ) -> Result<Self, Error> {
         let boot_list = config::load_all(&config_path)?;
         let mut boot = BTreeMap::new();
@@ -131,7 +156,7 @@ impl Runtime {
                 },
             );
         }
-        Ok(Self {
+        let runtime = Self {
             inner: Arc::new(Inner {
                 upstreams,
                 executor,
@@ -145,8 +170,97 @@ impl Runtime {
                 mutation_overrides: Mutex::new(mutation_overrides),
                 tool_session: Mutex::new(BTreeMap::new()),
                 pending_oauth: Mutex::new(HashMap::new()),
+                shapes: Mutex::new(BTreeMap::new()),
+                keysets: Mutex::new(BTreeMap::new()),
+                shapes_in_description,
+                enforce_mutations,
+                max_output_bytes,
             }),
-        })
+        };
+
+        // Spawn the shape-learning consumer if the channel is wired.
+        if let Some(rx) = shape_rx {
+            runtime.clone().spawn_shape_learner(rx);
+        }
+
+        Ok(runtime)
+    }
+
+    /// Consume observed tool-result values and learn each tool's return shape on
+    /// first sight. On a newly-learned shape, regenerate the SDK description (so
+    /// the shape is appended to that tool's entry) and notify clients.
+    fn spawn_shape_learner(
+        self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::control::ShapeEvent>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let key = (ev.server.clone(), ev.tool.clone());
+
+                // Validation tier: accumulate the FULL key structure by union on
+                // EVERY call (entity variants add keys; never capped). Track
+                // whether this call actually added anything new so we only ship to
+                // the worker when the keyset changed.
+                let keyset_changed = {
+                    let observed = crate::sdk::keyset::KeySet::extract(&ev.value);
+                    let mut keysets = self.inner.keysets.lock().await;
+                    match keysets.get(&key) {
+                        Some(existing) => {
+                            let merged = existing.clone().merge(observed);
+                            if &merged != existing {
+                                keysets.insert(key.clone(), merged);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => {
+                            keysets.insert(key.clone(), observed);
+                            true
+                        }
+                    }
+                };
+
+                // Description tier: only the FIRST successful call per tool teaches
+                // the lossy shape shown to the model. Skipped entirely when the
+                // description tier is disabled (validation-only mode).
+                let shape_is_new = if self.inner.shapes_in_description {
+                    let shapes = self.inner.shapes.lock().await;
+                    !shapes.contains_key(&key)
+                } else {
+                    false
+                };
+                if shape_is_new {
+                    match crate::sdk::shape::infer(&ev.value) {
+                        Some(shape) => {
+                            let mut shapes = self.inner.shapes.lock().await;
+                            // Re-check under the write lock (a call may have raced).
+                            if !shapes.contains_key(&key) {
+                                shapes.insert(key.clone(), shape);
+                            }
+                        }
+                        None => {
+                            // Scalar/empty: record an empty marker so we don't
+                            // re-infer the lossy shape on every later call.
+                            self.inner
+                                .shapes
+                                .lock()
+                                .await
+                                .insert(key.clone(), String::new());
+                        }
+                    }
+                }
+
+                // A new lossy shape changes the model-visible description; a
+                // changed keyset changes only what the worker validates against.
+                // Either way, regenerate + reload (which re-ships both).
+                if shape_is_new || keyset_changed {
+                    if let Err(e) = self.regenerate_and_reload().await {
+                        tracing::warn!(error = %e, "shape learn: regenerate failed");
+                    }
+                }
+            }
+        });
     }
 
     /// The config path this gateway was started with.
@@ -199,8 +313,14 @@ impl Runtime {
     pub async fn executor_run(
         &self,
         code: String,
-        opts: crate::control::RunOptions,
+        mut opts: crate::control::RunOptions,
     ) -> Result<crate::control::RunOutput, Error> {
+        // Enforcement is an operator setting, not a per-request arg. Inject it
+        // here so the worker knows whether to apply the mutation gate.
+        opts.enforce_mutations = self.inner.enforce_mutations;
+        // Likewise the output byte cap: operator setting, injected per run so the
+        // worker bounds result/stdout/stderr before they cross the wire.
+        opts.max_output_bytes = self.inner.max_output_bytes;
         self.inner.executor.run(code, opts).await
     }
 
@@ -343,10 +463,28 @@ impl Runtime {
         let overrides = self.inner.mutation_overrides.lock().await.clone();
         let registry = SdkRegistry::build_with_overrides(&filtered, &overrides);
         let sdk_py = registry.generate_sdk_py();
-        let description = prompt::build_description(&registry, self.inner.isolation);
+        // Tier 2: only render learned shapes into the description when enabled.
+        let shapes = if self.inner.shapes_in_description {
+            self.inner.shapes.lock().await.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let description = prompt::build_description(&registry, self.inner.isolation, &shapes);
+
+        // Build the fn_name -> KeySet map the worker validates against:
+        // declared-outputSchema seeds, with learned (observed) keysets unioned on
+        // top. Keyed by fn_name so the worker can correlate to SDK functions.
+        let validation_keysets = self.build_validation_keysets(&registry).await;
 
         // Hot-reload the worker's SDK module.
         self.inner.executor.reload_sdk(&sdk_py).await?;
+
+        // Ship the validation keysets to the worker (no-op when the map is empty,
+        // i.e. learning off and no outputSchemas). Failure is non-fatal: the
+        // worker just validates against whatever it last had.
+        if let Err(e) = self.inner.executor.set_shapes(&validation_keysets).await {
+            tracing::warn!(error = %e, "shape learn: shipping keysets to worker failed");
+        }
 
         // Swap the shared SDK state.
         {
@@ -366,6 +504,51 @@ impl Runtime {
         *peers = alive;
 
         Ok(())
+    }
+
+    /// Build the `fn_name -> KeySet` map the worker uses for return-field
+    /// validation: declared-`outputSchema` seeds first, with learned (observed)
+    /// keysets unioned on top so observation refines/extends the declared shape.
+    /// Keyed by fn_name (the names the validator sees in SDK calls).
+    async fn build_validation_keysets(
+        &self,
+        registry: &SdkRegistry,
+    ) -> BTreeMap<String, crate::sdk::keyset::KeySet> {
+        // Start from outputSchema seeds.
+        let mut out = registry.seed_keysets();
+        // Union learned keysets on top, mapping (server, tool) -> fn_name.
+        let learned = self.inner.keysets.lock().await;
+        for (fn_name, (server, tool)) in registry.routes() {
+            if let Some(observed) = learned.get(&(server.clone(), tool.clone())) {
+                let merged = match out.remove(fn_name) {
+                    Some(seed) => seed.merge(observed.clone()),
+                    None => observed.clone(),
+                };
+                if !merged.is_empty() {
+                    out.insert(fn_name.clone(), merged);
+                }
+            }
+        }
+        out
+    }
+
+    /// Ship the initial validation keysets (outputSchema seeds) to the worker at
+    /// startup. The shape-learning consumer re-ships on every refinement, but the
+    /// worker's SDK is first installed by `build_executor` (which never calls
+    /// `regenerate_and_reload`), so seeds would otherwise not reach it until the
+    /// first learned shape. Call once after `Runtime::new` when learning is on.
+    pub async fn seed_worker_validation(&self) {
+        let registry = {
+            let sdk = self.inner.sdk.lock().await;
+            // Rebuild seeds from the current registry's outputSchemas.
+            sdk.registry.seed_keysets()
+        };
+        if registry.is_empty() {
+            return;
+        }
+        if let Err(e) = self.inner.executor.set_shapes(&registry).await {
+            tracing::warn!(error = %e, "seeding worker validation keysets failed");
+        }
     }
 
     /// The effective enabled state for one tool: a session override wins, then

@@ -75,21 +75,23 @@ async fn build_executor(
     settings: &Settings,
     sdk_py: &str,
     upstreams: crate::upstream::SharedUpstreams,
+    shapes: crate::control::ShapeSink,
 ) -> Result<Arc<dyn Executor>> {
     match settings.isolation {
         Isolation::HostSystem => Ok(Arc::new(
-            HostExecutor::start(settings, sdk_py, upstreams).await?,
+            HostExecutor::start(settings, sdk_py, upstreams, shapes).await?,
         )),
         Isolation::Docker => {
             #[cfg(feature = "docker")]
             {
                 Ok(Arc::new(
-                    crate::exec::docker::DockerExecutor::start(settings, sdk_py, upstreams).await?,
+                    crate::exec::docker::DockerExecutor::start(settings, sdk_py, upstreams, shapes)
+                        .await?,
                 ))
             }
             #[cfg(not(feature = "docker"))]
             {
-                let _ = (sdk_py, upstreams);
+                let _ = (sdk_py, upstreams, shapes);
                 anyhow::bail!(
                     "CODEMCP_ISOLATION=DOCKER but this binary was built without the `docker` feature; rebuild with --features docker"
                 )
@@ -173,16 +175,26 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
         eprintln!("===== sdk.py =====\n{}", registry.generate_sdk_py());
         eprintln!(
             "===== execute_python description =====\n{}",
-            prompt::build_description(&registry, settings.isolation)
+            prompt::build_description(&registry, settings.isolation, &Default::default())
         );
     }
 
     let sdk_py = registry.generate_sdk_py();
     let upstreams = Arc::new(manager);
 
+    // Shape-learning channel: the control server emits each tool's (unwrapped)
+    // result value; the runtime consumes them to learn return shapes. Only wired
+    // when CODEMCP_LEARN_SHAPES is set, so the default path is unchanged.
+    let (shape_tx, shape_rx) = if settings.learn_shapes {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Smoke-test path: start the worker, run a snippet, print, exit.
     if let Ok(code) = std::env::var("CODEMCP_SMOKE") {
-        let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
+        let executor = build_executor(&settings, &sdk_py, upstreams.clone(), shape_tx).await?;
         let out = executor
             .run(code, crate::control::RunOptions::default())
             .await?;
@@ -199,14 +211,23 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
         if let Some(err) = &out.error {
             eprintln!("=== error ===\n{err}");
         }
+        // Drain any learned shapes so a smoke run can show them.
+        if let Some(mut rx) = shape_rx {
+            rx.close();
+            while let Ok(ev) = rx.try_recv() {
+                if let Some(shape) = crate::sdk::shape::infer(&ev.value) {
+                    eprintln!("=== shape {}/{} ===\n{shape}", ev.server, ev.tool);
+                }
+            }
+        }
         executor.shutdown().await;
         upstreams.shutdown().await;
         return Ok(());
     }
 
     // Start the Python worker and assemble the shared runtime.
-    let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
-    let description = prompt::build_description(&registry, settings.isolation);
+    let executor = build_executor(&settings, &sdk_py, upstreams.clone(), shape_tx).await?;
+    let description = prompt::build_description(&registry, settings.isolation, &Default::default());
     let launcher = launcher::Launcher::detect();
     tracing::info!(
         launcher = %launcher.name,
@@ -224,8 +245,18 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
             registry,
             description,
         },
+        shape_rx,
+        settings.shapes_in_description,
+        settings.enforce_mutations,
+        settings.max_output_bytes,
     )
     .await?;
+
+    // When shape-learning is on, seed the worker's return-field validator with
+    // any declared outputSchemas now (learned shapes refine it on first calls).
+    if settings.learn_shapes {
+        runtime.seed_worker_validation().await;
+    }
 
     // For HTTP, bind the TCP listener *before* starting the admin server, so a
     // port conflict fails fast without leaving a stale admin socket behind.

@@ -665,19 +665,36 @@ def _sdk_mutations(sdk_module):
     return set()
 
 
-def _validate_user_code(code, sdk_module, allow_mutations=None, dry_run=False):
+def _validate_user_code(
+    code,
+    sdk_module,
+    allow_mutations=None,
+    dry_run=False,
+    keysets=None,
+    enforce_mutations=False,
+):
     """Statically validate `code` against the SDK contract.
 
     Returns ``None`` if the code passes the pre-flight checks, otherwise a
     structured, human-readable error string describing each problem found.
 
-    ``allow_mutations`` is the set of mutating SDK fn names the caller explicitly
-    authorized for this run. Any mutating call not in that set is rejected before
-    execution, so a write can never happen without the model naming it.
+    The mutation gate is **opt-in**: it only runs when ``enforce_mutations`` is
+    true (operator setting `CODEMCP_ENFORCE_MUTATIONS`). By default writes are
+    allowed and this check is skipped entirely.
 
-    When ``dry_run`` is true the mutation-budget gate is skipped: no upstream
-    writes will happen anyway (the dispatcher stubs mutating calls), so the
-    validator lets the code through so the model can preview it.
+    ``allow_mutations`` is the set of mutating SDK fn names the caller explicitly
+    authorized for this run. When enforcement is on, any mutating call not in that
+    set is rejected before execution, so a write can't happen without the model
+    naming it.
+
+    When ``dry_run`` is true the mutation-budget gate is skipped even under
+    enforcement: no upstream writes will happen anyway (the dispatcher stubs
+    mutating calls), so the validator lets the code through so the model can
+    preview it.
+
+    `keysets` is the optional `fn_name -> KeySet` validation map shipped by the
+    gateway; when present, literal field access on values returned by SDK calls
+    is strictly checked against the learned/declared key structure.
     """
     # 1. Syntax.
     try:
@@ -700,9 +717,10 @@ def _validate_user_code(code, sdk_module, allow_mutations=None, dry_run=False):
     builtin_names = set(dir(builtins))
     mutations = _sdk_mutations(sdk_module)
     allowed = set(allow_mutations or ())
-    # Under dry_run every mutating call is stubbed by the dispatcher, so the
-    # mutation-budget gate is unnecessary: let the code through for preview.
-    enforce_mutations = not dry_run
+    # The gate is opt-in (operator's CODEMCP_ENFORCE_MUTATIONS). It's also skipped
+    # under dry_run, where the dispatcher stubs every mutating call so no write
+    # happens anyway. Default: no enforcement, writes are allowed.
+    gate_writes = bool(enforce_mutations) and not dry_run
 
     errors = []
     undeclared_mutations = set()
@@ -713,8 +731,9 @@ def _validate_user_code(code, sdk_module, allow_mutations=None, dry_run=False):
 
         if name in sdk_fns:
             _validate_call(node, name, sdk_fns[name], errors)
-            # Mutation budget: a write tool must be explicitly authorized.
-            if enforce_mutations and name in mutations and name not in allowed:
+            # Mutation budget: when enforcement is on, a write tool must be
+            # explicitly authorized.
+            if gate_writes and name in mutations and name not in allowed:
                 undeclared_mutations.add(name)
             continue
 
@@ -742,6 +761,10 @@ def _validate_user_code(code, sdk_module, allow_mutations=None, dry_run=False):
                 "`dry_run: true` to preview without writing.",
             )
         )
+
+    # Strict return-field validation (only when the gateway shipped keysets).
+    if keysets:
+        _validate_field_access(tree, sdk_fns, keysets, errors)
 
     if not errors:
         return None
@@ -795,15 +818,241 @@ def _last_expression_name(tree):
     return None
 
 
-def _exec_user_code(code, sdk_module, dispatcher, options=None):
+# ── return-field validation ──────────────────────────────────
+#
+# Track variables assigned directly from an SDK call (`x = github_get_me(...)`)
+# and strictly check literal field access on them (`x["lgoin"]`, `x.lgoin`,
+# nested `x["user"]["lgoin"]`) against the full key structure the gateway
+# learned/declared for that tool. Because the keyset is COMPLETE (no field caps,
+# unioned across observed variants), "key not present" is a trustworthy signal,
+# so we hard-flag it with a difflib suggestion — same UX as the kwarg check.
+#
+# Conservative by construction: only simple `name = sdk_fn(...)` bindings are
+# tracked; only literal subscripts/attributes are descended; the moment a chain
+# hits a non-object node, an unknown key, dynamic access, or array indexing we
+# stop. A tracked name that is reassigned or whose binding we can't prove is
+# dropped from tracking.
+
+
+def _keyset_kind(ks):
+    return ks.get("k") if isinstance(ks, dict) else None
+
+
+def _keyset_descend(ks, key):
+    """Return the child KeySet for `key`, or None if `key` is not a valid field.
+
+    Returns the sentinel ("__leaf__", None) semantics via two channels:
+      - (True, child)  -> `key` is valid; `child` is its KeySet (may be leaf)
+      - (False, keys)  -> `key` is NOT valid; `keys` is the list of valid keys
+      - (None, None)   -> cannot decide here (not an object / opaque); skip
+    """
+    kind = _keyset_kind(ks)
+    if kind != "object":
+        # Arrays and leaves can't be validated by a literal string key.
+        return (None, None)
+    fields = ks.get("fields") or {}
+    if not isinstance(fields, dict) or not fields:
+        return (None, None)
+    if key in fields:
+        return (True, fields[key])
+    return (False, list(fields.keys()))
+
+
+# Attribute names that address the `Pending` wrapper itself, not the result. A
+# variable bound to `x = sdk_fn(...)` is a `Pending`: indexing/attribute access
+# transparently resolves to the value, but these names call wrapper methods
+# (e.g. `x.result()`, `x.settled()`).
+_PENDING_API_NAMES = frozenset(
+    {
+        "result",
+        "settled",
+        "value",
+        "exception",
+        "as_dict",
+        "done",
+        "cancel",
+        "cancelled",
+    }
+)
+
+# Builtin methods of the containers a resolved tool result is made of (dict,
+# list, str). Attribute access with these names is a method call on the value
+# (e.g. `data["details"].get("bio")`, `items.append(...)`), never a result
+# field — so field-validation must not treat them as unknown keys. Applies at
+# ANY depth in an access chain, not just the first step.
+_CONTAINER_METHOD_NAMES = frozenset(
+    dir(dict) + dir(list) + dir(str) + dir(tuple) + dir(set)
+)
+
+# Any attribute name that should short-circuit field validation when reached via
+# attribute (not subscript) access: wrapper API + container builtins.
+_NON_FIELD_ATTR_NAMES = _PENDING_API_NAMES | _CONTAINER_METHOD_NAMES
+
+
+def _literal_access_chain(node):
+    """Peel a chain of literal subscripts/attributes off the OUTERMOST expr.
+
+    Given an AST node that is the *target* of access (e.g. the whole
+    `x["items"][0]["login"]`), return `(root_name, [steps...])` where root_name
+    is the base `ast.Name` id and each step is a typed tuple:
+      - ``("sub", "<field>")``  — literal string subscript `x["field"]`
+      - ``("attr", "<name>")``  — attribute access `x.name`
+      - ``("index", None)``     — literal integer subscript `x[0]`
+    Returns (None, None) if the chain isn't a pure literal access on a Name
+    (e.g. it uses a variable/slice subscript).
+    """
+    steps = []
+    cur = node
+    while True:
+        if isinstance(cur, ast.Subscript):
+            sl = cur.slice
+            # Py3.9+: slice is the expression directly.
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                steps.append(("sub", sl.value))  # field key
+                cur = cur.value
+                continue
+            if isinstance(sl, ast.Constant) and isinstance(sl.value, int) and not isinstance(
+                sl.value, bool
+            ):
+                steps.append(("index", None))  # array index
+                cur = cur.value
+                continue
+            return (None, None)  # non-literal / variable / slice -> bail
+        if isinstance(cur, ast.Attribute):
+            steps.append(("attr", cur.attr))
+            cur = cur.value
+            continue
+        if isinstance(cur, ast.Name):
+            steps.reverse()
+            return (cur.id, steps)
+        return (None, None)
+
+
+def _render_path(steps):
+    """Render the access path taken so far for an error message.
+
+    `[("sub","items"), ("index",None)]` -> `['items'][0]`; empty -> `result`.
+    """
+    if not steps:
+        return "result"
+    out = ""
+    for kind, val in steps:
+        if kind == "index":
+            out += "[0]"
+        elif kind == "attr":
+            out += f".{val}"
+        else:  # "sub"
+            out += f"[{val!r}]"
+    return out
+
+
+def _validate_field_access(tree, sdk_fns, keysets, errors):
+    # var -> fn_name, for `name = sdk_fn(...)` single-target assignments.
+    # If a name is EVER assigned to a non-SDK value (anywhere in the snippet), we
+    # refuse to track it: we can't prove which binding a given access refers to
+    # without flow analysis, so we stay silent rather than risk a false positive.
+    sdk_bindings = {}  # var -> fn_name (last SDK-call assignment)
+    non_sdk_assigned = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        var = node.targets[0].id
+        val = node.value
+        if (
+            isinstance(val, ast.Call)
+            and isinstance(val.func, ast.Name)
+            and val.func.id in sdk_fns
+            and val.func.id in keysets
+        ):
+            sdk_bindings[var] = val.func.id
+        else:
+            non_sdk_assigned.add(var)
+
+    tracked = {
+        var: fn for var, fn in sdk_bindings.items() if var not in non_sdk_assigned
+    }
+    if not tracked:
+        return
+
+    # Nodes that are the `.value` of an enclosing access are inner links of a
+    # larger chain; only validate the OUTERMOST node of each chain so a nested
+    # access like x["user"]["login"] is checked once, not once per link.
+    inner = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Subscript, ast.Attribute)):
+            inner.add(id(n.value))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Subscript, ast.Attribute)):
+            continue
+        if id(node) in inner:
+            continue  # not the outermost link of its chain
+        root, steps = _literal_access_chain(node)
+        if root is None or root not in tracked or not steps:
+            continue
+
+        fn_name = tracked[root]
+        ks = keysets.get(fn_name)
+        lineno = getattr(node, "lineno", 0)
+        # Descend step by step; stop at first undecidable or invalid step.
+        for depth, (kind, step) in enumerate(steps):
+            if kind == "index":
+                # Index into an array: descend into the element keyset. If this
+                # node isn't an array (polymorphic/opaque), stop validating.
+                if _keyset_kind(ks) == "array":
+                    ks = ks.get("items") or {"k": "leaf"}
+                    continue
+                break
+            if kind == "attr" and step in _NON_FIELD_ATTR_NAMES:
+                # `x.result()`, `data["a"].get(...)`, `items.append(...)`: an
+                # attribute call on the Pending wrapper or on a dict/list/str
+                # value — not a result field. Stop validating this chain.
+                break
+            ok, info = _keyset_descend(ks, step)
+            if ok is None:
+                break  # can't validate here (leaf/opaque) -> stop
+            if ok is False:
+                valid = info
+                where = f"(line {lineno})"
+                near = difflib.get_close_matches(step, valid, n=1, cutoff=_SUGGEST_CUTOFF)
+                path = _render_path(steps[:depth])
+                hint = (
+                    f"Did you mean `{near[0]}`?"
+                    if near
+                    else f"Available fields: {', '.join(valid)}."
+                )
+                errors.append(
+                    _format_call_error(
+                        fn_name,
+                        f"result{('' if path == 'result' else path)} has no field "
+                        f"`{step}` {where}.",
+                        hint,
+                    )
+                )
+                break
+            ks = info  # descend
+
+
+def _exec_user_code(code, sdk_module, dispatcher, options=None, keysets=None):
     """Execute user code, returning (result, stdout, stderr, error, trace, mutations)."""
     options = options or {}
     allow_mutations = options.get("allow_mutations") or []
     dry_run = bool(options.get("dry_run"))
+    enforce_mutations = bool(options.get("enforce_mutations"))
 
     # Pre-flight: reject statically-broken code before running anything, so the
     # model gets a precise hint instead of a post-hoc traceback.
-    validation_error = _validate_user_code(code, sdk_module, allow_mutations, dry_run)
+    validation_error = _validate_user_code(
+        code,
+        sdk_module,
+        allow_mutations,
+        dry_run,
+        keysets,
+        enforce_mutations=enforce_mutations,
+    )
     if validation_error is not None:
         return None, "", "", validation_error, [], []
 
@@ -890,12 +1139,65 @@ def _json_safe(value, _depth=0):
         return repr(value)
 
 
+# Fallback byte cap used when the gateway does not inject one (`max_output_bytes`
+# == 0). Mirrors the Rust-side default of 1 MiB so behavior is identical whether
+# or not the setting is threaded through.
+_DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
+
+
+def _truncate_text(text, limit):
+    """Cap a stdout/stderr string at `limit` UTF-8 bytes, appending a marker that
+    names how many bytes were dropped so the model knows output was clipped."""
+    if not text or limit <= 0:
+        return text
+    encoded = text.encode("utf-8", "replace")
+    if len(encoded) <= limit:
+        return text
+    dropped = len(encoded) - limit
+    clipped = encoded[:limit].decode("utf-8", "ignore")
+    return f"{clipped}\n…[truncated {dropped} bytes; raise CODEMCP_MAX_OUTPUT_BYTES or return a summary]"
+
+
+def _cap_result(value, limit):
+    """Bound a JSON-safe result at `limit` bytes. If the serialized value fits,
+    return it unchanged. Otherwise replace it with a compact, actionable envelope
+    so the model gets a signal + a hint instead of a wall of text (or a payload
+    that never should have crossed the wire)."""
+    if limit <= 0:
+        return value
+    try:
+        encoded = json.dumps(value).encode("utf-8", "replace")
+    except (TypeError, ValueError):
+        encoded = repr(value).encode("utf-8", "replace")
+    if len(encoded) <= limit:
+        return value
+    # Keep a small textual preview well under the cap so the envelope itself is
+    # never oversized.
+    preview_bytes = min(2048, max(0, limit - 256))
+    preview = encoded[:preview_bytes].decode("utf-8", "ignore")
+    return {
+        "_truncated": True,
+        "bytes": len(encoded),
+        "limit": limit,
+        "preview": preview,
+        "hint": (
+            "result exceeded CODEMCP_MAX_OUTPUT_BYTES; return a summary, select "
+            "specific fields, or write the full data to a file instead of "
+            "returning it verbatim"
+        ),
+    }
+
+
 class SdkHolder:
     """Mutable container for the current SDK module so `reload` can swap it."""
 
     def __init__(self, module, sdk_dir):
         self.module = module
         self.sdk_dir = sdk_dir
+        # fn_name -> KeySet dict (the serialized form shipped by the gateway),
+        # used for strict pre-flight return-field validation. Empty when the
+        # shape-learning feature is off.
+        self.keysets = {}
 
     def reload(self, source):
         """Overwrite sdk.py with `source` and re-import the module.
@@ -951,6 +1253,8 @@ async def main():
                 asyncio.create_task(_handle_run(ws, msg, holder, dispatcher))
             elif method == "reload":
                 await _handle_reload(ws, msg, holder)
+            elif method == "set_shapes":
+                await _handle_set_shapes(ws, msg, holder)
             elif method is None:
                 # A response to one of our call_tool requests.
                 await dispatcher.handle_response(msg)
@@ -972,6 +1276,28 @@ async def _handle_reload(ws, msg, holder):
     await ws.send(json.dumps(response))
 
 
+async def _handle_set_shapes(ws, msg, holder):
+    """Store the gateway's `fn_name -> KeySet` validation map on the holder.
+
+    The map is used by the pre-flight validator to strictly check literal field
+    access on values returned by SDK calls. Replacing wholesale each push keeps
+    the worker's view in lockstep with the gateway's accumulated knowledge.
+    """
+    rid = msg.get("id")
+    error = None
+    try:
+        shapes = msg.get("params", {}).get("shapes", {})
+        holder.keysets = shapes if isinstance(shapes, dict) else {}
+    except Exception:
+        error = traceback.format_exc()
+    response = {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "result": {"result": None, "stdout": "", "stderr": "", "error": error},
+    }
+    await ws.send(json.dumps(response))
+
+
 async def _handle_run(ws, msg, holder, dispatcher):
     params = msg.get("params", {}) or {}
     code = params.get("code", "")
@@ -979,18 +1305,30 @@ async def _handle_run(ws, msg, holder, dispatcher):
     options = {
         "allow_mutations": params.get("allow_mutations") or [],
         "dry_run": bool(params.get("dry_run")),
+        "enforce_mutations": bool(params.get("enforce_mutations")),
     }
+    # Operator byte cap for the payload sent back to the model. `0`/absent means
+    # the gateway didn't inject one, so fall back to the built-in default rather
+    # than shipping an unbounded result.
+    try:
+        cap = int(params.get("max_output_bytes") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        cap = _DEFAULT_MAX_OUTPUT_BYTES
     # Run user code off the event loop so SDK calls can round-trip.
     result_value, stdout, stderr, error, trace, mutations = await asyncio.to_thread(
-        _exec_user_code, code, holder.module, dispatcher, options
+        _exec_user_code, code, holder.module, dispatcher, options, holder.keysets
     )
+    # Bound every model-facing field before serialization so a runaway result or
+    # `print` can't blow the token budget or flood the transport.
     response = {
         "jsonrpc": "2.0",
         "id": rid,
         "result": {
-            "result": _json_safe(result_value),
-            "stdout": stdout,
-            "stderr": stderr,
+            "result": _cap_result(_json_safe(result_value), cap),
+            "stdout": _truncate_text(stdout, cap),
+            "stderr": _truncate_text(stderr, cap),
             "error": error,
             "trace": trace,
             "mutations": mutations,

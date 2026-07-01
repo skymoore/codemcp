@@ -2,6 +2,8 @@
 //! generates the importable `sdk.py`, and exposes routing metadata.
 
 pub mod codegen;
+pub mod keyset;
+pub mod shape;
 pub mod summary;
 
 use std::collections::{BTreeMap, HashMap};
@@ -91,6 +93,25 @@ impl SdkRegistry {
     #[allow(dead_code)]
     pub fn resolve(&self, fn_name: &str) -> Option<&(String, String)> {
         self.route.get(fn_name)
+    }
+
+    /// Iterate `(fn_name, (server, tool))` routing pairs.
+    pub fn routes(&self) -> impl Iterator<Item = (&String, &(String, String))> {
+        self.route.iter()
+    }
+
+    /// `fn_name` -> declared-outputSchema key structure, for tools that declare
+    /// one. Seeds return-field validation before any value is observed.
+    pub fn seed_keysets(&self) -> std::collections::BTreeMap<String, keyset::KeySet> {
+        let mut out = std::collections::BTreeMap::new();
+        for b in &self.bindings {
+            if let Some(ks) = &b.output_keyset {
+                if !ks.is_empty() {
+                    out.insert(b.fn_name.clone(), ks.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Generate the importable `sdk.py` source.

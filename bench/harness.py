@@ -19,11 +19,21 @@ import time
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-from configs import ZEN_BASE_URL, ZEN_MODEL, load_zen_api_key, mcp_config_for
+from configs import (
+    BENCH_PROVIDER,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
+    ZEN_BASE_URL,
+    ZEN_MODEL,
+    active_model,
+    arm_relists,
+    load_api_key,
+    mcp_config_for,
+)
 from tasks import SYSTEM_PROMPT
 
 # create_react_agent gives the standard agent -> tools loop and accepts a plain
@@ -38,8 +48,30 @@ RUN_TIMEOUT_S = 300
 RECURSION_LIMIT = 80
 
 
-def build_llm(api_key: str | None = None) -> ChatAnthropic:
-    key = api_key or load_zen_api_key()
+def build_llm(api_key: str | None = None):
+    """Build the chat model for the active provider (BENCH_PROVIDER).
+
+    - `openrouter`: ChatOpenAI against OpenRouter's OpenAI-compatible endpoint
+      with an automatic-prefix-caching model. This is the arm that exercises
+      prompt caching, so a shape-driven tools/list_changed (which mutates the
+      tool-schema prefix) can be observed busting the cache.
+    - `zen` (default): ChatAnthropic against OpenCode Zen.
+    """
+    key = api_key or load_api_key()
+    if BENCH_PROVIDER == "openrouter":
+        # Same Claude family as Zen, but via OpenRouter's Anthropic-native
+        # endpoint WITH prompt caching on. The tool-schema + system prefix is
+        # marked for caching (see build_agent), so a shape-driven
+        # tools/list_changed busts that cache — exactly what we want to measure.
+        return ChatAnthropic(
+            model=OPENROUTER_MODEL,
+            anthropic_api_url=OPENROUTER_BASE_URL,
+            api_key=key,
+            temperature=0,
+            max_tokens=4096,
+            timeout=120,
+            max_retries=2,
+        )
     return ChatAnthropic(
         model=ZEN_MODEL,
         anthropic_api_url=ZEN_BASE_URL,
@@ -53,17 +85,142 @@ def build_llm(api_key: str | None = None) -> ChatAnthropic:
 
 def _usage_of(msg: AIMessage) -> dict[str, int]:
     u = msg.usage_metadata or {}
+    # langchain normalizes cache tokens differently per provider:
+    #   Anthropic: flat `cache_read_input_tokens` / `cache_creation_input_tokens`
+    #   OpenAI/OpenRouter: nested `input_token_details.cache_read`
+    # Read both so the same code works for either provider.
+    details = u.get("input_token_details") or {}
+    cache_read = int(
+        u.get("cache_read_input_tokens", 0)
+        or details.get("cache_read", 0)
+        or 0
+    )
+    cache_creation = int(
+        u.get("cache_creation_input_tokens", 0)
+        or details.get("cache_creation", 0)
+        or 0
+    )
     return {
         "input": int(u.get("input_tokens", 0) or 0),
         "output": int(u.get("output_tokens", 0) or 0),
-        "cache_read": int(u.get("cache_read_input_tokens", 0) or 0),
-        "cache_creation": int(u.get("cache_creation_input_tokens", 0) or 0),
+        "cache_read": cache_read,
+        "cache_creation": cache_creation,
     }
 
 
 def _aggregate(per_turn: list[dict[str, int]]) -> dict[str, int]:
     keys = ("input", "output", "cache_read", "cache_creation")
     return {k: sum(t[k] for t in per_turn) for k in keys}
+
+
+def _agent_prompt(nonce: str = ""):
+    """The system prompt passed to the agent.
+
+    For the openrouter (Anthropic-native, caching-on) provider, return a
+    SystemMessage whose text block is marked `cache_control: ephemeral`. Anthropic
+    caches the request prefix up to and including the marked block, and tool
+    definitions sit before the system block in the request, so this caches the
+    tool-schema + system prefix together. When a learned shape mutates the
+    `execute_python` tool description, that prefix changes and the cache is busted
+    on the next turn — exactly the effect under test. For zen, a plain string.
+
+    `nonce` makes each run's cached prefix unique so the provider-side ephemeral
+    cache (≈5-min TTL) is NOT shared across runs — otherwise an earlier run would
+    warm the cache for a later one and contaminate the per-run measurement. We
+    only need the WITHIN-session turn-to-turn behavior (stable prefix → cache
+    hit on turn 2; mutated prefix → miss), so a per-run-unique prefix is correct.
+    """
+    if BENCH_PROVIDER == "openrouter":
+        text = SYSTEM_PROMPT if not nonce else f"{SYSTEM_PROMPT}\n\n[run:{nonce}]"
+        return SystemMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        )
+    return SYSTEM_PROMPT
+
+
+def _list_changed_handler(event: asyncio.Event):
+    """Build an MCP `message_handler` that sets `event` on tools/list_changed.
+
+    A spec-compliant MCP client SHOULD react to
+    `notifications/tools/list_changed` by re-listing tools. The default
+    langchain-mcp-adapters flow calls `load_mcp_tools` once and never installs
+    such a handler, so it never learns the tool list changed. We install this
+    handler (via session_kwargs) for the relist arm; the agent loop then re-lists
+    and re-binds whenever the event is set. This is the ONLY behavioral
+    difference between codemcp_shapes (snapshot-once) and codemcp_shapes_relist.
+    """
+    from mcp.types import ServerNotification, ToolListChangedNotification
+
+    async def handler(message: Any) -> None:
+        # message is a RequestResponder | ServerNotification | Exception.
+        note = getattr(message, "root", message)
+        if isinstance(message, ServerNotification) and isinstance(
+            note, ToolListChangedNotification
+        ):
+            event.set()
+
+    return handler
+
+
+async def _run_relisting_agent(
+    session,
+    llm: ChatAnthropic,
+    tools: list,
+    task: dict[str, Any],
+    label: str,
+    list_changed: asyncio.Event,
+) -> tuple[list, int]:
+    """Manual agent loop that re-lists + re-binds tools on tools/list_changed.
+
+    Each turn, if the gateway has signalled list_changed since the last turn, we
+    re-run load_mcp_tools(session) and re-bind, so the NEXT model request carries
+    the updated `execute_python` description (now including any learned shapes).
+    Returns (messages, relist_count). relist_count > 0 proves the client actually
+    picked up a mid-session change.
+    """
+    tools_by_name = {t.name: t for t in tools}
+    model = llm.bind_tools(tools)
+    prompt = _agent_prompt(label)  # SystemMessage (openrouter) or str (zen)
+    system_msg = prompt if isinstance(prompt, SystemMessage) else SystemMessage(content=prompt)
+    messages: list = [system_msg, HumanMessage(content=task["prompt"])]
+    relist_count = 0
+    for _ in range(RECURSION_LIMIT):
+        # Pick up any mid-session tool-list change BEFORE issuing the next turn,
+        # so the new descriptions reach the model on this very request.
+        if list_changed.is_set():
+            list_changed.clear()
+            tools = await load_mcp_tools(session)
+            tools_by_name = {t.name: t for t in tools}
+            model = llm.bind_tools(tools)
+            relist_count += 1
+
+        ai: AIMessage = await model.ainvoke(messages)
+        messages.append(ai)
+        if not ai.tool_calls:
+            break
+        for call in ai.tool_calls:
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                messages.append(
+                    ToolMessage(
+                        content=f"error: unknown tool {call['name']!r}",
+                        tool_call_id=call["id"],
+                    )
+                )
+                continue
+            try:
+                out = await tool.ainvoke(call["args"])
+                content = out if isinstance(out, str) else str(out)
+            except Exception as e:  # noqa: BLE001
+                content = f"error: {type(e).__name__}: {e}"
+            messages.append(ToolMessage(content=content, tool_call_id=call["id"]))
+    return messages, relist_count
 
 
 async def run_one(
@@ -76,25 +233,50 @@ async def run_one(
     """Run a single task under one arm. Returns a run record dict."""
     cfg = mcp_config_for(arm)
     server_name = next(iter(cfg))
+    relists = arm_relists(arm)
+
+    # For the relist arm, install a tools/list_changed handler on the session so
+    # the client learns when the gateway mutates the tool list mid-session.
+    list_changed = asyncio.Event()
+    if relists:
+        conn = cfg[server_name]
+        sk = dict(conn.get("session_kwargs") or {})
+        sk["message_handler"] = _list_changed_handler(list_changed)
+        conn["session_kwargs"] = sk
+
     client = MultiServerMCPClient(cfg)
+    relist_count = 0
     # Stateful session: keep the MCP connection alive for the whole agent run so
     # the upstream (github container / codemcp gateway) isn't relaunched per
     # tool call — matters for wall-time fairness and avoids docker churn.
     async with client.session(server_name) as session:
         tools = await load_mcp_tools(session)
-        agent = _make_agent(model=llm, tools=tools, prompt=SYSTEM_PROMPT)
 
         t0 = time.perf_counter()
         error: str | None = None
         result: dict[str, Any] = {}
         try:
-            result = await asyncio.wait_for(
-                agent.ainvoke(
-                    {"messages": [HumanMessage(content=task["prompt"])]},
-                    config={"recursion_limit": RECURSION_LIMIT},
-                ),
-                timeout=RUN_TIMEOUT_S,
-            )
+            if relists:
+                msgs_out, relist_count = await asyncio.wait_for(
+                    _run_relisting_agent(
+                        session, llm, tools, task, label, list_changed
+                    ),
+                    timeout=RUN_TIMEOUT_S,
+                )
+                result = {"messages": msgs_out}
+            else:
+                # Use the unique run label as the cache nonce so runs don't share
+                # the provider-side ephemeral prompt cache (see _agent_prompt).
+                agent = _make_agent(
+                    model=llm, tools=tools, prompt=_agent_prompt(label)
+                )
+                result = await asyncio.wait_for(
+                    agent.ainvoke(
+                        {"messages": [HumanMessage(content=task["prompt"])]},
+                        config={"recursion_limit": RECURSION_LIMIT},
+                    ),
+                    timeout=RUN_TIMEOUT_S,
+                )
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
         wall = time.perf_counter() - t0
@@ -119,14 +301,16 @@ async def run_one(
         "arm": arm,
         "task_id": task["id"],
         "task_name": task["name"],
-        "model": ZEN_MODEL,
-        "endpoint": ZEN_BASE_URL,
+        "model": active_model(),
+        "endpoint": OPENROUTER_BASE_URL if BENCH_PROVIDER == "openrouter" else ZEN_BASE_URL,
+        "provider": BENCH_PROVIDER,
         "label": label,
         "wall_seconds": round(wall, 3),
         "num_turns": num_turns,
         "tool_calls": tool_calls,
         "tool_results": tool_results,
         "num_tools_bound": len(tools),
+        "relisted": relist_count,
         "usage_per_turn": per_turn,
         "totals": _aggregate(per_turn),
         "final_answer": final_answer,
