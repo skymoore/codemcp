@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 
-use crate::control::{ControlHandle, ControlServer, RunOutput};
+use crate::control::{ControlHandle, ControlServer, RunOptions, RunOutput};
 use crate::env::Settings;
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
@@ -101,8 +101,8 @@ impl HostExecutor {
 
 #[async_trait]
 impl super::Executor for HostExecutor {
-    async fn run(&self, code: String) -> Result<RunOutput, Error> {
-        match tokio::time::timeout(self.timeout, self.handle.run(&code)).await {
+    async fn run(&self, code: String, opts: RunOptions) -> Result<RunOutput, Error> {
+        match tokio::time::timeout(self.timeout, self.handle.run(&code, &opts)).await {
             Ok(res) => res,
             Err(_) => Err(Error::Timeout(self.timeout)),
         }

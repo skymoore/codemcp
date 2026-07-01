@@ -23,7 +23,27 @@ pub fn build_description(registry: &SdkRegistry, isolation: Isolation) -> String
     s.push_str(
         "All SDK functions below are ALREADY IMPORTED into your execution namespace — \
          do NOT import them. Call them directly. Return a value by assigning to `result` \
-         or leaving it as the last expression; anything printed to stdout is also captured.\n\n",
+         or by leaving it as the final expression; anything printed to stdout is also \
+         captured. Nested Pending values are auto-resolved before the result is returned, \
+         so you never need json.dumps tricks to force resolution.\n\n",
+    );
+    s.push_str(
+        "Single call? Just make it the last line — no `result =` needed:\n\
+         ``github_get_file_contents(owner='o', repo='r', path='p')``\n\n",
+    );
+    s.push_str(
+        "Never lose a partial result to one failing call. `gather(...)` resolves many \
+         calls without raising and returns the allSettled shape \
+         (``[{'ok': True, 'value': ...}, {'ok': False, 'error': {...}}]``):\n\
+         ``result = gather(tool_a(...), tool_b(...), tool_c(...))``\n\
+         A raised failure is a structured `ToolError` with .kind/.server/.tool/.args. \
+         Add a per-call deadline with the `timeout_ms` kwarg on any call.\n\n",
+    );
+    s.push_str(
+        "Writes are gated. Tools that mutate state must be authorized: pass \
+         `allow_mutations=[\"<fn_name>\", ...]` alongside your code, or set \
+         `dry_run=true` to preview exactly what would change without writing. Every run \
+         returns a compact `trace` of the calls it made and a `mutations` audit.\n\n",
     );
 
     match isolation {

@@ -41,13 +41,39 @@ class FakeDispatcher:
 
     Each call returns a real bootstrap.Pending wrapping a loop future; the future
     is completed by a delayed callback on the loop, so concurrency is genuine.
+    Honours per-run trace/dry-run/mutation state exactly like the real one.
     """
 
     def __init__(self, loop):
         self._loop = loop
+        self._trace = None
+        self._dry_run = False
+        self._mutations = frozenset()
+
+    def begin_run(self, trace, dry_run, mutations):
+        self._trace = trace
+        self._dry_run = bool(dry_run)
+        self._mutations = frozenset(mutations or ())
+
+    def _fn_name(self, server, tool):
+        def san(x):
+            return "".join(c if (c.isalnum() or c == "_") else "_" for c in x)
+        return f"{san(server)}_{san(tool)}"
 
     def call_tool(self, server, tool, args):
+        is_mutation = self._fn_name(server, tool) in self._mutations
+        if self._dry_run and is_mutation:
+            if self._trace is not None:
+                self._trace.record(
+                    server=server, tool=tool, args=args, ok=True,
+                    kind="dry_run", elapsed_ms=0, mutation=True,
+                )
+            return bootstrap._DryRunResult(server, tool, args)
+
         fut = self._loop.create_future()
+        timeout = None
+        if isinstance(args, dict) and "timeout_ms" in args:
+            timeout = float(args.pop("timeout_ms")) / 1000.0
 
         async def _resolve():
             await asyncio.sleep(DELAY)
@@ -60,16 +86,28 @@ class FakeDispatcher:
                 )
 
         asyncio.run_coroutine_threadsafe(_resolve(), self._loop)
-        return bootstrap.Pending(fut, self._loop, server, tool)
+        return bootstrap.Pending(
+            fut, self._loop, server, tool,
+            args=args, trace=self._trace, timeout=timeout, mutation=is_mutation,
+        )
 
 
 def make_sdk_module(dispatcher):
-    """Build a fake sdk module exposing t1, t2, t3 and a failing boom()."""
+    """Build a fake sdk module exposing t1, t2, t3, a failing boom(), and a
+    mutating write() tool (registered in _codemcp_mutations).
+
+    Mirrors the generated SDK shape: functions accept named tool params plus
+    ``**_extra`` and forward universal kwargs (e.g. ``timeout_ms``) into the
+    args dict so the dispatcher sees them exactly as the real codegen does.
+    """
     mod = types.ModuleType("sdk")
 
     def _make(tool):
         def fn(**kwargs):
-            return mod._codemcp_dispatch("srv", tool, kwargs)
+            # Real codegen builds _args from named params and forwards universal
+            # kwargs from **_extra. Here every kwarg is treated as a tool param
+            # for simplicity, but timeout_ms is a universal kwarg by contract.
+            return mod._codemcp_dispatch("srv", tool, dict(kwargs))
 
         fn.__name__ = tool
         return fn
@@ -78,6 +116,8 @@ def make_sdk_module(dispatcher):
     mod.t2 = _make("t2")
     mod.t3 = _make("t3")
     mod.boom = _make("boom")
+    mod.write = _make("write")
+    mod._codemcp_mutations = {"srv_write"}
     mod._codemcp_dispatch = dispatcher.call_tool
     return mod
 
@@ -97,8 +137,17 @@ def run_loop_in_thread():
     return loop, t
 
 
-def exec_code(code, sdk_module, dispatcher):
-    return bootstrap._exec_user_code(code, sdk_module, dispatcher)
+def exec_code(code, sdk_module, dispatcher, options=None):
+    # Return (result, stdout, stderr, error) for the legacy call sites; the new
+    # trace/mutations are exercised via exec_full below.
+    r, out, err, error, _trace, _muts = bootstrap._exec_user_code(
+        code, sdk_module, dispatcher, options
+    )
+    return r, out, err, error
+
+
+def exec_full(code, sdk_module, dispatcher, options=None):
+    return bootstrap._exec_user_code(code, sdk_module, dispatcher, options)
 
 
 FAILS = []
@@ -200,6 +249,105 @@ result = {"xs": xs, "elapsed": elapsed}
         f"elapsed={result['elapsed']:.3f}s vs sum={5 * DELAY:.3f}s",
     )
 
+    print("7. gather() resolves many calls without raising (allSettled)")
+    code = """
+result = gather(t1(x=1), boom(), t2(y=2))
+"""
+    result, out, err, error = exec_code(code, sdk_module, dispatcher)
+    check("no uncaught error", error is None, error or "")
+    check("three settled entries", isinstance(result, list) and len(result) == 3, repr(result))
+    check("first ok", result and result[0]["ok"] is True, repr(result[0]))
+    check("second failed structured", result and result[1]["ok"] is False
+          and result[1]["error"]["server"] == "srv", repr(result[1]))
+    check("third ok", result and result[2]["ok"] is True, repr(result[2]))
+
+    print("8. trace records every call with timing + ok flag")
+    result, out, err, error, trace, muts = exec_full(
+        "result = [t1(x=1)['tool'], t2(y=2)['tool']]", sdk_module, dispatcher
+    )
+    check("no error", error is None, error or "")
+    check("two trace entries", len(trace) == 2, repr(trace))
+    check("trace has server/tool/ok/elapsed",
+          all({"server", "tool", "ok", "elapsed_ms"} <= set(e) for e in trace),
+          repr(trace))
+    check("all ok", all(e["ok"] for e in trace), repr(trace))
+
+    print("9. uncaught ToolError becomes a structured error field")
+    result, out, err, error, trace, muts = exec_full(
+        "result = boom()['x']", sdk_module, dispatcher
+    )
+    check("structured error emitted", error is not None, repr(error))
+    import json as _json
+    parsed = None
+    try:
+        parsed = _json.loads(error)
+    except Exception:
+        pass
+    check("error is json with tool_error",
+          isinstance(parsed, dict) and "tool_error" in parsed, repr(error))
+    check("localized to server/tool",
+          parsed and parsed["tool_error"]["server"] == "srv"
+          and parsed["tool_error"]["tool"] == "boom", repr(parsed))
+    check("trace records the failure",
+          any(not e["ok"] for e in trace), repr(trace))
+
+    print("10. dry_run stubs mutating calls, records mutation, does not dispatch")
+    result, out, err, error, trace, muts = exec_full(
+        "result = write(title='x')", sdk_module, dispatcher, {"dry_run": True}
+    )
+    check("no error", error is None, error or "")
+    check("stub returned", isinstance(result, dict) and result.get("_dry_run") is True, repr(result))
+    check("mutation audited", len(muts) == 1 and muts[0]["tool"] == "write", repr(muts))
+
+    print("10b. dry_run bypasses the mutation-budget validator gate")
+    # No allow_mutations declared, but dry_run must let it through.
+    result, out, err, error, trace, muts = exec_full(
+        "result = write(title='x')", sdk_module, dispatcher,
+        {"dry_run": True},  # deliberately no allow_mutations
+    )
+    check("no error", error is None, repr(error))
+    check("stub returned under dry_run", isinstance(result, dict) and result.get("_dry_run"), repr(result))
+
+    print("11. authorized mutation actually dispatches (non-dry-run)")
+    result, out, err, error, trace, muts = exec_full(
+        "result = write(title='x')['tool']", sdk_module, dispatcher,
+        {"allow_mutations": ["srv_write"]},
+    )
+    check("no error", error is None, error or "")
+    check("dispatched real call", result == "write", repr(result))
+    check("mutation audited as performed", len(muts) == 1 and muts[0]["ok"] is True, repr(muts))
+
+    print("12. recursive resolve of nested Pending in result container")
+    code = """
+result = {"a": t1(x=1), "items": [t2(y=2), t3(z=3)]}
+"""
+    result, out, err, error = exec_code(code, sdk_module, dispatcher)
+    check("no error", error is None, error or "")
+    check("nested dict Pending resolved",
+          isinstance(result["a"], dict) and result["a"]["tool"] == "t1", repr(result.get("a")))
+    check("nested list Pending resolved",
+          result["items"][0]["tool"] == "t2" and result["items"][1]["tool"] == "t3",
+          repr(result.get("items")))
+
+    print("13. per-call timeout_ms surfaces a structured timeout ToolError")
+    code = """
+try:
+    # DELAY is 0.2s; a 1ms deadline must trip.
+    t1(x=1, timeout_ms=1)["tool"]
+    result = "no-timeout"
+except ToolError as e:
+    result = {"kind": e.kind, "tool": e.tool}
+"""
+    result, out, err, error = exec_code(code, sdk_module, dispatcher)
+    check("no uncaught error", error is None, error or "")
+    check("timeout classified",
+          isinstance(result, dict) and result.get("kind") == "timeout", repr(result))
+
+    # Let any in-flight delayed resolvers (e.g. behind the timeout test, whose
+    # Pending we abandoned) finish on the loop before we stop it, so teardown is
+    # quiet. The loop runs on a daemon thread and dies with the process.
+    import time as _t
+    _t.sleep(DELAY + 0.05)
     loop.call_soon_threadsafe(loop.stop)
 
     print()

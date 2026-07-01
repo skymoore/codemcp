@@ -4,7 +4,7 @@
 pub mod codegen;
 pub mod summary;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
@@ -20,13 +20,27 @@ pub struct SdkRegistry {
 }
 
 impl SdkRegistry {
-    /// Build the registry from discovered upstream tools.
+    /// Build the registry from discovered upstream tools (no config overrides).
+    /// Retained for tests and callers that have no mutation overrides.
+    #[cfg(test)]
     pub fn build(tools: &[NamespacedTool]) -> Self {
+        Self::build_with_overrides(tools, &BTreeMap::new())
+    }
+
+    /// Build the registry from discovered upstream tools.
+    ///
+    /// `mutation_overrides` maps `(server, tool)` to an explicit mutation
+    /// classification from config, taking precedence over annotations/heuristic.
+    pub fn build_with_overrides(
+        tools: &[NamespacedTool],
+        mutation_overrides: &BTreeMap<(String, String), bool>,
+    ) -> Self {
         let mut bindings = Vec::new();
         let mut route = HashMap::new();
         let mut seen = HashMap::<String, u32>::new();
 
         for nt in tools {
+            let tool_json: Value = serde_json::to_value(&nt.tool).unwrap_or(Value::Null);
             let input_schema: Value = serde_json::to_value(&*nt.tool.input_schema)
                 .unwrap_or_else(|_| Value::Object(Default::default()));
             let output_schema: Option<Value> = nt
@@ -35,6 +49,13 @@ impl SdkRegistry {
                 .as_ref()
                 .and_then(|s| serde_json::to_value(&**s).ok());
 
+            let annotations = tool_json.get("annotations");
+            let config_override = mutation_overrides
+                .get(&(nt.server.clone(), nt.tool.name.as_ref().to_string()))
+                .copied();
+            let is_mutation =
+                codegen::classify_mutation(nt.tool.name.as_ref(), annotations, config_override);
+
             let summ = summary::from_description(&nt.tool);
             let mut binding = codegen::build_binding(
                 &nt.server,
@@ -42,6 +63,7 @@ impl SdkRegistry {
                 &summ,
                 &input_schema,
                 output_schema.as_ref(),
+                is_mutation,
             );
 
             // Disambiguate any accidental fn-name collisions across servers.
@@ -85,6 +107,18 @@ impl SdkRegistry {
         out.push_str("def _codemcp_dispatch(server: str, tool: str, args: dict) -> Any:\n");
         out.push_str("    raise RuntimeError('codemcp dispatch not initialized')\n\n\n");
 
+        // Set of generated fn names classified as mutating (write) tools. The
+        // worker's pre-flight validator uses this to require explicit
+        // `allow_mutations` authorization before any write executes.
+        out.push_str("# Generated fn names that mutate state (require allow_mutations).\n");
+        out.push_str("_codemcp_mutations = {\n");
+        for b in &self.bindings {
+            if b.is_mutation {
+                out.push_str(&format!("    {:?},\n", b.fn_name));
+            }
+        }
+        out.push_str("}\n\n\n");
+
         for b in &self.bindings {
             out.push_str(&b.signature);
             out.push('\n');
@@ -104,6 +138,14 @@ impl SdkRegistry {
                     ));
                 }
             }
+            // Forward universal kwargs (timeout_ms, ...) into _args so the
+            // dispatcher can honour them. Unknown extras are silently dropped
+            // to keep the tool's own schema authoritative.
+            out.push_str(
+                "    for _k in (\"timeout_ms\",):\n\
+                 \x20       if _k in _extra:\n\
+                 \x20           _args[_k] = _extra[_k]\n",
+            );
             out.push_str(&format!(
                 "    return _codemcp_dispatch({:?}, {:?}, _args)\n\n\n",
                 b.server, b.tool_name
@@ -143,8 +185,41 @@ mod tests {
         let reg = SdkRegistry::build(&tools);
         assert_eq!(reg.bindings.len(), 1);
         let src = reg.generate_sdk_py();
-        assert!(src.contains("def everything_get_sum(a: int, b: int) -> dict[str, Any]:"));
+        assert!(src.contains(
+            "def everything_get_sum(a: int, b: int, **_extra: Any) -> dict[str, Any]:"
+        ));
         assert!(src.contains("_codemcp_dispatch(\"everything\", \"get-sum\", _args)"));
+        assert!(src.contains("_codemcp_mutations = {"));
         assert!(reg.resolve("everything_get_sum").is_some());
+        // A read-verb tool is not in the mutation set.
+        assert!(!reg.bindings[0].is_mutation);
+    }
+
+    #[test]
+    fn mutation_tools_emitted_in_set() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"]
+        });
+        let tools = vec![
+            tool("create-issue", "Create an issue", schema.clone()),
+            tool("get-issue", "Read an issue", schema),
+        ];
+        let reg = SdkRegistry::build(&tools);
+        let src = reg.generate_sdk_py();
+        assert!(src.contains("\"everything_create_issue\","));
+        assert!(!src.contains("\"everything_get_issue\","));
+    }
+
+    #[test]
+    fn mutation_override_forces_classification() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let tools = vec![tool("get-thing", "Read a thing", schema)];
+        let mut overrides = BTreeMap::new();
+        overrides.insert(("everything".to_string(), "get-thing".to_string()), true);
+        let reg = SdkRegistry::build_with_overrides(&tools, &overrides);
+        assert!(reg.bindings[0].is_mutation);
+        assert!(reg.generate_sdk_py().contains("\"everything_get_thing\","));
     }
 }

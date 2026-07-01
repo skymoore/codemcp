@@ -151,11 +151,21 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     let configs = config::load(&settings.config)?;
     tracing::info!(count = configs.len(), "loaded upstream server configs");
 
+    // Per-tool mutation-classification overrides, keyed by (server, tool).
+    let mutation_overrides: std::collections::BTreeMap<(String, String), bool> = configs
+        .iter()
+        .flat_map(|c| {
+            c.mutation_overrides
+                .iter()
+                .map(move |(tool, m)| ((c.name.clone(), tool.clone()), *m))
+        })
+        .collect();
+
     let manager = UpstreamManager::connect_all(&configs).await;
     let tools = manager.all_tools().await;
     tracing::info!(total_tools = tools.len(), "discovered upstream tools");
 
-    let registry = SdkRegistry::build(&tools);
+    let registry = SdkRegistry::build_with_overrides(&tools, &mutation_overrides);
     tracing::info!(bindings = registry.bindings.len(), "generated SDK bindings");
 
     // Debug dump when requested.
@@ -173,13 +183,19 @@ async fn run_gateway(http_override: Option<(String, u16)>) -> Result<()> {
     // Smoke-test path: start the worker, run a snippet, print, exit.
     if let Ok(code) = std::env::var("CODEMCP_SMOKE") {
         let executor = build_executor(&settings, &sdk_py, upstreams.clone()).await?;
-        let out = executor.run(code).await?;
+        let out = executor
+            .run(code, crate::control::RunOptions::default())
+            .await?;
         eprintln!(
             "=== result ===\n{}",
             serde_json::to_string_pretty(&out.result)?
         );
         eprintln!("=== stdout ===\n{}", out.stdout);
         eprintln!("=== stderr ===\n{}", out.stderr);
+        eprintln!(
+            "=== trace ===\n{}",
+            serde_json::to_string_pretty(&out.trace)?
+        );
         if let Some(err) = &out.error {
             eprintln!("=== error ===\n{err}");
         }

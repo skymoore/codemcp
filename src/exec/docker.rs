@@ -33,7 +33,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures::StreamExt;
 
-use crate::control::{ControlHandle, RunOutput};
+use crate::control::{ControlHandle, RunOptions, RunOutput};
 use crate::env::{self, Settings};
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
@@ -386,8 +386,8 @@ async fn remove_container(docker: &Docker, id: &str) -> Result<(), Error> {
 
 #[async_trait]
 impl super::Executor for DockerExecutor {
-    async fn run(&self, code: String) -> Result<RunOutput, Error> {
-        match tokio::time::timeout(self.timeout, self.handle.run(&code)).await {
+    async fn run(&self, code: String, opts: RunOptions) -> Result<RunOutput, Error> {
+        match tokio::time::timeout(self.timeout, self.handle.run(&code, &opts)).await {
             Ok(res) => res,
             Err(_) => Err(Error::Timeout(self.timeout)),
         }

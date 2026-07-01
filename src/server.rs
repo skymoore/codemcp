@@ -37,7 +37,21 @@ impl CodeServer {
                 "code": {
                     "type": "string",
                     "description": "Python source to execute. SDK functions are preloaded; \
-                                    assign to `result` (or leave a final expression) to return a value."
+                                    assign to `result` or leave a final expression to return a value."
+                },
+                "allow_mutations": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "SDK function names for mutating (write) tools you \
+                                    authorize this run to call, e.g. \
+                                    [\"github_create_pull_request\"]. A write tool not \
+                                    listed here is rejected before execution."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview mode. Mutating calls are NOT sent upstream — \
+                                    they return a deterministic stub — while read calls \
+                                    still execute. Returns the mutations that would occur."
                 }
             },
             "required": ["code"],
@@ -59,6 +73,15 @@ impl CodeServer {
             Cow::Owned(self.runtime.description().await),
             self.input_schema.clone(),
         )
+    }
+}
+
+/// Coerce a worker-provided value into a JSON array (worker may send null when a
+/// run failed before producing a trace).
+fn normalize_list(v: Value) -> Value {
+    match v {
+        Value::Array(_) => v,
+        _ => Value::Array(Vec::new()),
     }
 }
 
@@ -96,9 +119,8 @@ impl ServerHandler for CodeServer {
             ));
         }
 
-        let code = request
-            .arguments
-            .as_ref()
+        let args = request.arguments.as_ref();
+        let code = args
             .and_then(|a| a.get("code"))
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -106,15 +128,40 @@ impl ServerHandler for CodeServer {
             })?
             .to_string();
 
-        let out = self.runtime.executor_run(code).await?;
+        let allow_mutations = args
+            .and_then(|a| a.get("allow_mutations"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let dry_run = args
+            .and_then(|a| a.get("dry_run"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let opts = crate::control::RunOptions {
+            allow_mutations,
+            dry_run,
+        };
+
+        let out = self.runtime.executor_run(code, opts).await?;
+
+        // Compact, always-present fields the harness can render/audit.
+        let trace = normalize_list(out.trace);
+        let mutations = normalize_list(out.mutations);
 
         // User code raised: surface as a tool error (structured), not a protocol
-        // error — the agent can read the traceback and retry.
+        // error — the agent can read the traceback and retry. Include the trace
+        // so partial failures are localized to the exact call.
         if let Some(err) = out.error {
             return Ok(CallToolResult::structured_error(json!({
                 "error": err,
                 "stdout": out.stdout,
                 "stderr": out.stderr,
+                "trace": trace,
             })));
         }
 
@@ -122,6 +169,8 @@ impl ServerHandler for CodeServer {
             "result": out.result,
             "stdout": out.stdout,
             "stderr": out.stderr,
+            "trace": trace,
+            "mutations": mutations,
         })))
     }
 }

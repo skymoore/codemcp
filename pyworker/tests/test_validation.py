@@ -68,6 +68,9 @@ class _NoopDispatcher:
     # never dispatch (the test functions return plain values), so None is fine.
     _loop = None
 
+    def begin_run(self, trace, dry_run, mutations):
+        pass
+
     def call_tool(self, server, tool, args):
         raise AssertionError("dispatcher must not be called in these tests")
 
@@ -151,23 +154,58 @@ result = github_search_issues(**opts)
     check("not flagged (body optional)", err is None, repr(err))
 
     print("8. _exec_user_code short-circuits on validation error")
-    result, out, errs, error = bootstrap._exec_user_code(
+    result, out, errs, error, trace, mutations = bootstrap._exec_user_code(
         "result = github_serch_issues(query='x')", sdk, _NoopDispatcher()
     )
     check("error surfaced", error is not None and "validation" in error.lower(), repr(error))
     check("no result", result is None, repr(result))
     check("no stdout", out == "", repr(out))
+    check("no trace", trace == [], repr(trace))
 
     print("8b. valid code still executes through _exec_user_code")
     # Give the SDK function a body that returns a concrete value for this check.
     sdk.github_create_issue = lambda owner, repo, title, body=None: {"ok": True}
-    result, out, errs, error = bootstrap._exec_user_code(
+    result, out, errs, error, trace, mutations = bootstrap._exec_user_code(
         "result = github_create_issue(owner='o', repo='r', title='t')",
         sdk,
         _NoopDispatcher(),
+        {"allow_mutations": ["github_create_issue"]},
     )
     check("executed, no error", error is None, repr(error))
     check("returned value", result == {"ok": True}, repr(result))
+
+    print("9. final-expression return needs no `result =`")
+    sdk.github_search_issues = lambda query, state=None, perPage=None: {"n": 1}
+    result, out, errs, error, trace, mutations = bootstrap._exec_user_code(
+        "github_search_issues(query='x')", sdk, _NoopDispatcher()
+    )
+    check("final expr captured", result == {"n": 1}, repr(result))
+    check("no error", error is None, repr(error))
+
+    print("10. mutation budget: undeclared write is rejected")
+    sdk._codemcp_mutations = {"github_create_issue"}
+    err = V("result = github_create_issue(owner='o', repo='r', title='t')", sdk)
+    check("undeclared write flagged", err is not None and "mutating" in err, repr(err))
+    check("suggests allow_mutations", err is not None and "allow_mutations" in err, repr(err))
+
+    print("10b. declared write passes validation")
+    err = bootstrap._validate_user_code(
+        "result = github_create_issue(owner='o', repo='r', title='t')",
+        sdk,
+        ["github_create_issue"],
+    )
+    check("declared write ok", err is None, repr(err))
+
+    print("10c. dry_run bypasses the mutation-budget gate")
+    err = bootstrap._validate_user_code(
+        "result = github_create_issue(owner='o', repo='r', title='t')",
+        sdk,
+        allow_mutations=None,
+        dry_run=True,
+    )
+    check("dry_run undeclared write ok", err is None, repr(err))
+    # Clean up module-level state for any later checks.
+    sdk._codemcp_mutations = set()
 
     print()
     if FAILS:

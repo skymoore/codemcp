@@ -86,6 +86,9 @@ struct Inner {
     /// Persisted per-tool default `enabled` flags, keyed by (server, tool).
     /// Seeded from `mcp.json` at boot and updated on `--make-default`.
     tool_defaults: Mutex<BTreeMap<(String, String), bool>>,
+    /// Per-tool mutation-classification overrides, keyed by (server, tool).
+    /// Seeded from `mcp.json` at boot; passed to SDK generation.
+    mutation_overrides: Mutex<BTreeMap<(String, String), bool>>,
     /// In-memory per-tool session overrides for this gateway run, keyed by
     /// (server, tool). Wins over `tool_defaults`. Cleared on restart.
     tool_session: Mutex<BTreeMap<(String, String), bool>>,
@@ -112,9 +115,13 @@ impl Runtime {
         let boot_list = config::load_all(&config_path)?;
         let mut boot = BTreeMap::new();
         let mut tool_defaults = BTreeMap::new();
+        let mut mutation_overrides = BTreeMap::new();
         for c in boot_list {
             for (tool, en) in &c.tool_defaults {
                 tool_defaults.insert((c.name.clone(), tool.clone()), *en);
+            }
+            for (tool, m) in &c.mutation_overrides {
+                mutation_overrides.insert((c.name.clone(), tool.clone()), *m);
             }
             boot.insert(
                 c.name,
@@ -135,6 +142,7 @@ impl Runtime {
                 sdk: Mutex::new(sdk),
                 peers: Mutex::new(Vec::new()),
                 tool_defaults: Mutex::new(tool_defaults),
+                mutation_overrides: Mutex::new(mutation_overrides),
                 tool_session: Mutex::new(BTreeMap::new()),
                 pending_oauth: Mutex::new(HashMap::new()),
             }),
@@ -188,8 +196,12 @@ impl Runtime {
     }
 
     /// Run user code in the Python worker.
-    pub async fn executor_run(&self, code: String) -> Result<crate::control::RunOutput, Error> {
-        self.inner.executor.run(code).await
+    pub async fn executor_run(
+        &self,
+        code: String,
+        opts: crate::control::RunOptions,
+    ) -> Result<crate::control::RunOutput, Error> {
+        self.inner.executor.run(code, opts).await
     }
 
     /// Register a connected MCP client peer (for tool-list-changed notifications).
@@ -328,7 +340,8 @@ impl Runtime {
             .into_iter()
             .filter(|nt| effective(&nt.server, nt.tool.name.as_ref()))
             .collect();
-        let registry = SdkRegistry::build(&filtered);
+        let overrides = self.inner.mutation_overrides.lock().await.clone();
+        let registry = SdkRegistry::build_with_overrides(&filtered, &overrides);
         let sdk_py = registry.generate_sdk_py();
         let description = prompt::build_description(&registry, self.inner.isolation);
 

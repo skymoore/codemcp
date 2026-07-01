@@ -92,11 +92,20 @@ pub struct ConfigFile {
 pub struct ToolEnabledCfg {
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Operator override for mutation classification. `Some(true)` forces the
+    /// tool to be treated as a write (requires `allow_mutations`); `Some(false)`
+    /// exempts it. Absent means "use annotation/heuristic classification".
+    #[serde(default)]
+    pub mutation: Option<bool>,
 }
 
 impl ToolEnabledCfg {
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    pub fn mutation_override(&self) -> Option<bool> {
+        self.mutation
     }
 }
 
@@ -177,6 +186,8 @@ pub struct UpstreamConfig {
     pub enabled: bool,
     /// Explicitly-set per-tool default `enabled` flags (absent => default on).
     pub tool_defaults: BTreeMap<String, bool>,
+    /// Explicit per-tool mutation-classification overrides (absent => auto).
+    pub mutation_overrides: BTreeMap<String, bool>,
 }
 
 /// Load + parse the config file, interpolate `{env:VAR}`, and return only the
@@ -202,12 +213,18 @@ pub fn load_all(path: &Path) -> Result<Vec<UpstreamConfig>, Error> {
             .iter()
             .map(|(tool, cfg)| (tool.clone(), cfg.enabled()))
             .collect();
+        let mutation_overrides = spec
+            .tool_defaults()
+            .iter()
+            .filter_map(|(tool, cfg)| cfg.mutation_override().map(|m| (tool.clone(), m)))
+            .collect();
         interpolate_spec(&mut spec)?;
         out.push(UpstreamConfig {
             name,
             spec,
             enabled,
             tool_defaults,
+            mutation_overrides,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

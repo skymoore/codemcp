@@ -24,6 +24,15 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::Error;
 use crate::upstream::SharedUpstreams;
 
+/// Options controlling a single `run` request.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Mutating (write) SDK fn names the caller authorizes for this run.
+    pub allow_mutations: Vec<String>,
+    /// Preview mode: mutating calls are stubbed, reads still execute.
+    pub dry_run: bool,
+}
+
 /// Result of a `run` request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunOutput {
@@ -36,6 +45,12 @@ pub struct RunOutput {
     /// Set by the worker when user code raised.
     #[serde(default)]
     pub error: Option<String>,
+    /// Per-call trace: one entry per tool call the run made.
+    #[serde(default)]
+    pub trace: Value,
+    /// Audit of mutating calls actually performed during the run.
+    #[serde(default)]
+    pub mutations: Value,
 }
 
 /// A pending `run` request awaiting its response.
@@ -52,7 +67,7 @@ pub struct ControlHandle {
 
 impl ControlHandle {
     /// Send `run { code }` and await the worker's response.
-    pub async fn run(&self, code: &str) -> Result<RunOutput, Error> {
+    pub async fn run(&self, code: &str, opts: &RunOptions) -> Result<RunOutput, Error> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -63,7 +78,11 @@ impl ControlHandle {
             "jsonrpc": "2.0",
             "id": id,
             "method": "run",
-            "params": { "code": code }
+            "params": {
+                "code": code,
+                "allow_mutations": opts.allow_mutations,
+                "dry_run": opts.dry_run,
+            }
         });
         self.outbound
             .send(Message::Text(msg.to_string()))
@@ -282,6 +301,8 @@ async fn handle_incoming(
                                 stdout: String::new(),
                                 stderr: String::new(),
                                 error: Some("malformed run result".into()),
+                                trace: Value::Null,
+                                mutations: Value::Null,
                             });
                     let _ = tx.send(Ok(out));
                 }

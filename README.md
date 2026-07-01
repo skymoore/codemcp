@@ -242,6 +242,10 @@ verbatim** into codemcp's `mcp.json`, and rewrites opencode to launch a single
    - `"tools": { "<name>": { "enabled": false } }` hides individual tools by
      default. Omitted tools default to enabled. See
      [Enabling/disabling tools](#enablingdisabling-tools-at-runtime) below.
+   - `"tools": { "<name>": { "mutation": true|false } }` overrides how a tool is
+     classified for write-safety. `true` forces it to require `allow_mutations`;
+     `false` exempts it. Omitted → auto-classified from MCP annotations + a
+     name-verb heuristic. See [Write safety](#write-safety-mutation-gating-dry-run-and-audit-trail).
    - `"timeout": <seconds>` caps how long to wait for that upstream to spawn and
      finish the MCP handshake (default 30s). An upstream that exceeds it is
      logged and skipped rather than blocking startup.
@@ -584,6 +588,9 @@ check can never drift from what the model sees). It catches:
 - **Unknown keyword arguments** — `github_search_issues(stat="open")` →
   *"unknown argument `stat`. Did you mean `state`?"* (or lists the valid args).
 - **Missing required arguments** — names exactly which ones are absent.
+- **Unauthorized mutations** — a call to a write tool that is not listed in
+  `allow_mutations` → *"is a mutating (write) tool and was not authorized.
+  Re-send with this call listed in `allow_mutations`, or use `dry_run: true`."*
 
 If anything fails, the call returns the collected hints in the `error` field
 **without running any code**. The check is deliberately conservative: locally
@@ -644,6 +651,84 @@ try:
 except ToolError as e:
     val = None
 ```
+
+`ToolError` is **structured**: `e.kind` (`timeout`/`auth`/`transport`/
+`not_found`/`upstream_error`), `e.server`, `e.tool`, `e.call_args`, and
+`e.elapsed_ms` localize the failure precisely. An uncaught `ToolError` is
+returned as a structured JSON `error` field (`{"tool_error": {...}}`) rather than
+a raw traceback, so a partial failure in a batch names the exact call and args.
+
+Every call also accepts a per-call deadline via the `timeout_ms` kwarg:
+
+```python
+slow = kubernetes_pods_list(timeout_ms=2000)   # trips a timeout ToolError after 2s
+```
+
+### Ergonomics: single calls, allSettled, auto-resolve
+
+For a one-off call there's no boilerplate — the final expression is the result:
+
+```python
+github_get_file_contents(owner="o", repo="r", path="README.md")
+```
+
+`gather(...)` (alias `settle`) resolves many calls **without raising**, returning
+the allSettled shape so one failure never discards the rest of the batch:
+
+```python
+result = gather(
+    grafana_prod_list_datasources(),
+    argocd_prod_list_applications(),
+    github_get_me(),
+)
+# -> [{"ok": True, "value": ...}, {"ok": False, "error": {"kind": ..., "server": ...}}, ...]
+```
+
+Nested `Pending` values inside the returned `result` (in dicts, lists, tuples)
+are **deep-resolved automatically** before the result is serialized, so you never
+need `json.dumps(..., default=str)` tricks to force resolution. `resolve(x)` is
+also available to eagerly resolve a nested structure mid-run.
+
+### Write safety: mutation gating, dry-run, and audit trail
+
+codemcp classifies every tool as read or **mutation** (write). Classification is,
+in priority order: the MCP `readOnlyHint`/`destructiveHint` annotation, then an
+operator override in `mcp.json` (`tools.<tool>.mutation: true|false`), then a
+name-verb heuristic (`create_*`, `*_delete`, `*_merge`, `run_*`, … are writes;
+`get_*`, `list_*`, `search_*`, … are reads).
+
+A mutating call is **rejected before execution** unless the run explicitly
+authorizes it. This makes code-mode *safer* than per-tool calls: a write can
+never happen without the model naming it.
+
+```jsonc
+// Reads: nothing extra needed.
+{ "code": "result = github_get_me()" }
+
+// Writes: enumerate them in allow_mutations, or the run is rejected pre-flight.
+{
+  "code": "result = github_create_pull_request(owner='o', repo='r', title='t', head='f', base='main')",
+  "allow_mutations": ["github_create_pull_request"]
+}
+
+// Preview a chain of dependent writes without touching anything.
+{ "code": "...", "dry_run": true }
+```
+
+Under `dry_run`, mutating calls are **not** sent upstream — they return a
+deterministic stub (with common keys like `id`/`number`/`url` populated) so
+dependent logic still runs — while read calls execute normally. The response
+reports the `mutations` that *would* have occurred.
+
+Every run returns two audit fields:
+
+- `trace` — one compact entry per tool call: `{server, tool, ok, elapsed_ms,
+  mutation, kind?}`. The per-tool-call observability you otherwise lose when
+  calls are batched.
+- `mutations` — the write calls actually performed (or previewed under dry-run).
+
+Sensitive argument values (tokens, passwords, keys, …) are redacted from
+`trace`/`mutations`/error output.
 
 ### Self-provisioning worker
 

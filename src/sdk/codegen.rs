@@ -21,6 +21,9 @@ pub struct PyBinding {
     pub signature: String,
     /// Ordered parameter names as they appear in the MCP schema (for arg mapping).
     pub params: Vec<ParamSpec>,
+    /// Whether this tool mutates state (write). Requires explicit authorization
+    /// (`allow_mutations`) before the worker will execute it.
+    pub is_mutation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +156,166 @@ pub fn return_type(output_schema: Option<&Value>) -> String {
     }
 }
 
+/// Verb prefixes that strongly indicate a tool mutates state. Matched against
+/// the (lowercased) tool name's leading word, split on `_`/`-`/`.`/space.
+const MUTATION_VERBS: &[&str] = &[
+    "create",
+    "update",
+    "delete",
+    "remove",
+    "add",
+    "edit",
+    "set",
+    "put",
+    "patch",
+    "write",
+    "modify",
+    "merge",
+    "push",
+    "run",
+    "exec",
+    "execute",
+    "install",
+    "uninstall",
+    "apply",
+    "scale",
+    "restart",
+    "start",
+    "stop",
+    "kill",
+    "terminate",
+    "destroy",
+    "cleanup",
+    "clean",
+    "transition",
+    "assign",
+    "move",
+    "rename",
+    "copy",
+    "upload",
+    "send",
+    "post",
+    "publish",
+    "deploy",
+    "revert",
+    "rollback",
+    "cancel",
+    "approve",
+    "reject",
+    "close",
+    "reopen",
+    "enable",
+    "disable",
+    "grant",
+    "revoke",
+    "rotate",
+    "reset",
+    "drop",
+    "insert",
+    "fork",
+    "sync",
+    "trigger",
+    "invoke",
+    "schedule",
+    "provision",
+];
+
+/// Read words that override a mutation-verb false positive (e.g. `get_status`,
+/// `list_runs`). If the leading word is one of these, treat as read-only.
+const READ_VERBS: &[&str] = &[
+    "get", "list", "read", "search", "fetch", "find", "describe", "show", "view", "query", "check",
+    "status", "info", "lookup", "count", "watch", "download", "export", "diff", "inspect",
+    "analyze", "resolve",
+];
+
+/// Classify whether a tool is a mutation. Priority:
+/// 1. explicit MCP annotation `readOnlyHint` (true => read, false => write),
+/// 2. an operator override supplied via config (`Some(bool)`),
+/// 3. a name-verb heuristic (default read-only when ambiguous).
+pub fn classify_mutation(
+    tool_name: &str,
+    annotations: Option<&Value>,
+    config_override: Option<bool>,
+) -> bool {
+    // 2. Config override wins over the heuristic (but not over an explicit
+    //    read-only hint below, which the operator can still see).
+    if let Some(m) = config_override {
+        return m;
+    }
+    // 1. MCP annotations.
+    if let Some(ann) = annotations {
+        if let Some(ro) = ann.get("readOnlyHint").and_then(Value::as_bool) {
+            return !ro;
+        }
+        if let Some(dh) = ann.get("destructiveHint").and_then(Value::as_bool) {
+            if dh {
+                return true;
+            }
+        }
+    }
+    // 3. Heuristic on the tool name's words.
+    let words: Vec<String> = tool_name
+        .split(['_', '-', '.', ' '])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let lead = words.first().map(String::as_str).unwrap_or("");
+
+    // Leading read verb (e.g. `get_status`, `list_runs`) is authoritative: these
+    // are reads even if a later word looks mutating.
+    if READ_VERBS.contains(&lead) {
+        return false;
+    }
+    // Leading write verb, or a strong write verb appearing anywhere (covers
+    // object-first names like `pods_delete`, `pull_request_merge`).
+    if MUTATION_VERBS.contains(&lead) {
+        return true;
+    }
+    words
+        .iter()
+        .any(|w| STRONG_MUTATION_VERBS.contains(&w.as_str()))
+}
+
+/// Unambiguous write verbs that indicate a mutation no matter where they appear
+/// in the tool name (e.g. `pods_delete`, `workflow_run`, `branch_merge`).
+const STRONG_MUTATION_VERBS: &[&str] = &[
+    "create",
+    "delete",
+    "remove",
+    "update",
+    "merge",
+    "destroy",
+    "terminate",
+    "kill",
+    "cancel",
+    "revert",
+    "rollback",
+    "apply",
+    "scale",
+    "restart",
+    "deploy",
+    "publish",
+    "rotate",
+    "revoke",
+    "grant",
+    "drop",
+    "truncate",
+    "purge",
+    "reset",
+    "rename",
+    "run",
+    "exec",
+    "execute",
+    "trigger",
+    "install",
+    "uninstall",
+    "provision",
+    "transition",
+    "assign",
+    "approve",
+    "reject",
+];
+
 /// Build a [`PyBinding`] for one tool.
 pub fn build_binding(
     server: &str,
@@ -160,6 +323,7 @@ pub fn build_binding(
     summary: &str,
     input_schema: &Value,
     output_schema: Option<&Value>,
+    is_mutation: bool,
 ) -> PyBinding {
     let fn_name = fn_name(server, tool_name);
 
@@ -202,6 +366,9 @@ pub fn build_binding(
 
     let mut sig_params = sig_required;
     sig_params.extend(sig_optional);
+    // Universal kwargs (e.g. timeout_ms) are accepted by every SDK function.
+    // The generated body forwards them into _args so the dispatcher sees them.
+    sig_params.push("**_extra: Any".to_string());
 
     let ret = return_type(output_schema);
     let signature = format!("def {fn_name}({}) -> {ret}:", sig_params.join(", "));
@@ -213,6 +380,7 @@ pub fn build_binding(
         summary: summary.to_string(),
         signature,
         params,
+        is_mutation,
     }
 }
 
@@ -239,12 +407,21 @@ mod tests {
             },
             "required": ["a", "b"]
         });
-        let b = build_binding("everything", "get-sum", "Returns the sum", &schema, None);
+        let b = build_binding(
+            "everything",
+            "get-sum",
+            "Returns the sum",
+            &schema,
+            None,
+            false,
+        );
         assert_eq!(b.fn_name, "everything_get_sum");
         assert!(b.signature.starts_with("def everything_get_sum("));
         assert!(b.signature.contains("a: int"));
         assert!(b.signature.contains("b: int"));
         assert!(b.signature.contains("label: str | None = None"));
+        // Every SDK fn accepts universal kwargs (timeout_ms) via **_extra.
+        assert!(b.signature.contains("**_extra: Any"));
         assert!(b.signature.ends_with("-> dict[str, Any]:"));
     }
 
@@ -258,5 +435,51 @@ mod tests {
     fn array_of_strings() {
         let s = json!({"type": "array", "items": {"type": "string"}});
         assert_eq!(py_type(&s), "list[str]");
+    }
+
+    #[test]
+    fn mutation_heuristic_by_verb() {
+        // Write verbs.
+        assert!(classify_mutation("create_issue", None, None));
+        assert!(classify_mutation("delete-pod", None, None));
+        assert!(classify_mutation("pods_delete", None, None));
+        assert!(classify_mutation("update_pull_request", None, None));
+        // Read verbs (including read-verb overrides of ambiguous names).
+        assert!(!classify_mutation("get_me", None, None));
+        assert!(!classify_mutation("list_applications", None, None));
+        assert!(!classify_mutation("search_issues", None, None));
+        assert!(!classify_mutation("get_status", None, None));
+        // Ambiguous/unknown leading word defaults to read-only.
+        assert!(!classify_mutation("foobar", None, None));
+        // Object-first names where the verb is a later word.
+        assert!(classify_mutation("pods_delete", None, None));
+        assert!(classify_mutation("pull_request_merge", None, None));
+        assert!(classify_mutation("workflow_run", None, None));
+        // Leading read verb wins even if a later word looks mutating.
+        assert!(!classify_mutation("get_check_runs", None, None));
+        assert!(!classify_mutation("list_deployments", None, None));
+        // A read that happens to contain a non-strong word stays read.
+        assert!(!classify_mutation("pull_request_read", None, None));
+    }
+
+    #[test]
+    fn mutation_annotation_wins_over_heuristic() {
+        // readOnlyHint:true forces read even for a write-verb name.
+        let ann = json!({"readOnlyHint": true});
+        assert!(!classify_mutation("delete_thing", Some(&ann), None));
+        // readOnlyHint:false forces write even for a read-verb name.
+        let ann = json!({"readOnlyHint": false});
+        assert!(classify_mutation("get_thing", Some(&ann), None));
+        // destructiveHint:true marks write.
+        let ann = json!({"destructiveHint": true});
+        assert!(classify_mutation("do_thing", Some(&ann), None));
+    }
+
+    #[test]
+    fn mutation_config_override_wins() {
+        // Operator can force a read-verb tool to be treated as a mutation.
+        assert!(classify_mutation("get_thing", None, Some(true)));
+        // ...or exempt a write-verb tool.
+        assert!(!classify_mutation("delete_thing", None, Some(false)));
     }
 }
